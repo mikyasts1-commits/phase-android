@@ -71,6 +71,10 @@ const fundingApi = {
   },
   getBalances: (userId) =>
     backendFetch(`/funding/balances?userId=${encodeURIComponent(userId)}`),
+  getBtcAddress: (userId) =>
+    backendFetch(`/funding/btc/address?userId=${encodeURIComponent(userId)}`),
+  getBtcBalance: (userId) =>
+    backendFetch(`/funding/btc/balance?userId=${encodeURIComponent(userId)}`),
 };
 
 /* ============================================================================
@@ -3191,7 +3195,10 @@ function FundAccountModal({ onClose, onFund }) {
     { id: "BASE-SEPOLIA", label: "Base Sepolia", currencies: ["USDC", "USDT"] },
     { id: "MATIC-AMOY", label: "Polygon Amoy", currencies: ["USDC", "USDT"] },
     { id: "SOLANA-DEVNET", label: "Solana Devnet", currencies: ["USDC"] },
+    { id: "BTC-TESTNET", label: "Bitcoin Testnet", currencies: ["BTC"], isBtc: true },
   ];
+
+  const isBtcChain = chain === "BTC-TESTNET";
 
   useEffect(() => {
     loadDepositInfo();
@@ -3210,15 +3217,25 @@ function FundAccountModal({ onClose, onFund }) {
     setStep("loading");
     setError(null);
     try {
-      const [dep, bal] = await Promise.all([
-        fundingApi.getDepositInfo("app-user"),
-        fundingApi.getBalances("app-user").catch(() => null),
-      ]);
-      if (!mountedRef.current) return;
-      setDepositInfo(dep);
-      setBalances(bal);
-      const firstChain = dep.defaultChain || Object.keys(dep.addresses || {})[0];
-      if (firstChain) setChain(firstChain);
+      if (isBtcChain) {
+        const [addr, bal] = await Promise.all([
+          fundingApi.getBtcAddress("app-user"),
+          fundingApi.getBtcBalance("app-user").catch(() => null),
+        ]);
+        if (!mountedRef.current) return;
+        setDepositInfo({ addresses: { "BTC-TESTNET": addr.address }, defaultChain: "BTC-TESTNET", testnet: addr.testnet });
+        setBalances(bal ? { totals: { BTC: { credited: bal.confirmedBtc, pending: bal.mempoolBtc } } } : null);
+      } else {
+        const [dep, bal] = await Promise.all([
+          fundingApi.getDepositInfo("app-user"),
+          fundingApi.getBalances("app-user").catch(() => null),
+        ]);
+        if (!mountedRef.current) return;
+        setDepositInfo(dep);
+        setBalances(bal);
+        const firstChain = dep.defaultChain || Object.keys(dep.addresses || {})[0];
+        if (firstChain) setChain(firstChain);
+      }
       setStep("deposit");
     } catch (e) {
       if (!mountedRef.current) return;
@@ -3226,6 +3243,11 @@ function FundAccountModal({ onClose, onFund }) {
       setStep("error");
     }
   };
+
+  // Reload when switching between BTC and Circle chains
+  useEffect(() => {
+    if (step === "deposit") loadDepositInfo();
+  }, [chain]);
 
   const copyAddress = async () => {
     const addr = depositInfo?.addresses?.[chain];
@@ -3249,6 +3271,20 @@ function FundAccountModal({ onClose, onFund }) {
     setPollCount(0);
     pollRef.current = setInterval(async () => {
       try {
+        if (isBtcChain) {
+          const bal = await fundingApi.getBtcBalance("app-user");
+          if (!mountedRef.current) return;
+          setPollCount((n) => n + 1);
+          const credited = parseFloat(bal?.confirmedBtc || "0");
+          const pending = parseFloat(bal?.mempoolBtc || "0");
+          if (credited > 0 || pending > 0) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+            setStep("confirmed");
+            onFund && onFund("btc", credited || pending, "BTC deposit");
+          }
+          return;
+        }
         const bal = await fundingApi.getBalances("app-user");
         if (!mountedRef.current) return;
         setBalances(bal);
