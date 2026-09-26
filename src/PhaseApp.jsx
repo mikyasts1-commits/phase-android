@@ -1297,6 +1297,8 @@ export default function App() {
   const [holdings, setHoldings] = useState([]); // { assetId, units, costBasisUsd }
   const [txHistory, setTxHistory] = useState([]);
   const [cashBalances, setCashBalances] = useState({}); // { usd: 0, cad: 0, usdc: 0, ... } funded cash, separate from PHASE coins
+  const [cryptoFunded, setCryptoFunded] = useState(false); // true once real testnet balances are detected
+  const [hasIssuedCoin, setHasIssuedCoin] = useState(false); // true once the user mints their own coin
   const [netWorthHistory, setNetWorthHistory] = useState([]); // [{ t, valueUsd }] for the dashboard trend line
   const [chatOpen, setChatOpen] = useState(false);
   const [toast, setToast] = useState(null);
@@ -1307,6 +1309,31 @@ export default function App() {
     window.clearTimeout(showToast._t);
     showToast._t = window.setTimeout(() => setToast(null), 2600);
   }, []);
+
+  // Poll real crypto funding balances — unlocks the dashboard once testnet
+  // deposits land (or once the user mints their own coin).
+  const refreshFundingStatus = useCallback(async () => {
+    try {
+      const data = await fundingApi.getBalances("app-user");
+      const balances = data.balances || data || {};
+      const total = Object.values(balances).reduce((sum, b) => {
+        const credited = typeof b === "object" ? (b.credited || 0) : b;
+        return sum + (Number(credited) || 0);
+      }, 0);
+      setCryptoFunded(total > 0);
+    } catch {
+      // Backend unreachable — stay locked, don't crash
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshFundingStatus();
+    const t = setInterval(refreshFundingStatus, 30000);
+    return () => clearInterval(t);
+  }, [refreshFundingStatus]);
+
+  // Dashboard unlocks when the user has real funds OR has issued their own coin
+  const dashboardUnlocked = cryptoFunded || hasIssuedCoin;
 
   // In-app update check — once per launch, silent unless a newer GitHub
   // release exists and this version wasn't snoozed.
@@ -1527,6 +1554,7 @@ export default function App() {
 
   const fundAccount = (currencyId, amountInCurrency, method) => {
     if (amountInCurrency <= 0) return;
+    setCryptoFunded(true); // real deposit confirmed — unlock the dashboard
     setCashBalances((prev) => ({
       ...prev,
       [currencyId]: (prev[currencyId] || 0) + amountInCurrency,
@@ -1597,7 +1625,7 @@ export default function App() {
           />
         )}
         {activeTab === "dashboard" && (
-          DASHBOARD_LOCKED ? (
+          !dashboardUnlocked ? (
             <div className="dashboard-wrap">
               <div className="glass-card empty-state">
                 <Icon name="wallet" size={30} />
@@ -1950,6 +1978,7 @@ function GoLiveTab({ onPublish }) {
         onBack={() => setFlowStep("form")}
         onComplete={(mintedCoin, isMeme) => {
           // Hand the real minted coin to the parent for dashboard unlock.
+          setHasIssuedCoin(true);
           const asset = onPublish({
             name: mintedCoin.name,
             category,
