@@ -21,7 +21,7 @@ export const CRYPTO_FUNDING_LOCKED = true;
 // behind a lock card instead of the operable coin-issuance form, until the
 // legal review of user-issued coins is complete.
 // Set to false to restore the issuance form.
-export const GO_LIVE_LOCKED = true;
+export const GO_LIVE_LOCKED = false;
 
 // DASHBOARD_LOCKED: when true, the Dashboard shows a simple "fund your
 // account" empty state instead of simulated portfolio and net-worth figures.
