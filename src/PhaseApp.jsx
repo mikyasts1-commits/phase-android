@@ -47,6 +47,10 @@ const socialApi = {
     backendFetch(`/social/connections?userId=${encodeURIComponent(userId)}`),
   disconnect: (provider, userId) =>
     backendFetch(`/social/${provider}`, { method: "DELETE", body: { userId } }),
+  previewCard: (coinName, ticker, meme) =>
+    backendFetch("/social/cards/preview", { method: "POST", body: { coinName, ticker, meme } }),
+  announce: (userId, coinName, ticker, meme) =>
+    backendFetch("/social/announce", { method: "POST", body: { userId, coinName, ticker, meme } }),
 };
 
 // Compact number formatting: 1234 -> "1.2K", 2500000 -> "2.5M"
@@ -2659,37 +2663,12 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
 
   if (step === "done" && mintResult) {
     return (
-      <div className="issuance-flow issuance-status">
-        <span className="issuance-success-icon"><Icon name="check" size={28} /></span>
-        <h2 className="section-title">{mintResult.name} is live!</h2>
-        <p className="section-sub">
-          {mintResult.isMeme
-            ? "Minted as a meme coin — no agreement attached."
-            : "Issuer Agreement signed and recorded."}
-        </p>
-        <div className="mint-details">
-          <div className="mint-detail-row">
-            <span className="stat-label">Mint address</span>
-            <span className="stat-value mono">{mintResult.mintAddress}</span>
-          </div>
-          <div className="mint-detail-row">
-            <span className="stat-label">Transaction</span>
-            <span className="stat-value mono">{mintResult.txSignature.slice(0, 20)}…</span>
-          </div>
-          <div className="mint-detail-row">
-            <span className="stat-label">Supply</span>
-            <span className="stat-value">1,000,000 {mintResult.ticker}</span>
-          </div>
-        </div>
-        <a
-          className="btn-secondary"
-          href={`https://explorer.solana.com/address/${mintResult.mintAddress}?cluster=devnet`}
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          View on Solana Explorer
-        </a>
-      </div>
+      <IssuanceDoneScreen
+        mintResult={mintResult}
+        coin={coin}
+        socialConns={socialConns}
+        onBack={onBack}
+      />
     );
   }
 
@@ -2707,8 +2686,91 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
   );
 }
 
-function ProvisioningModal({ steps, activeIndex, chainId, name }) {
-  const isFinalStep = activeIndex === steps.length - 1;
+function IssuanceDoneScreen({ mintResult, coin, socialConns, onBack }) {
+  const [announcing, setAnnouncing] = useState(false);
+  const [announceResult, setAnnounceResult] = useState(null);
+  const [cardUrl, setCardUrl] = useState(null);
+
+  const handleAnnounce = async () => {
+    setAnnouncing(true);
+    try {
+      const res = await socialApi.announce("app-user", coin.name, coin.ticker, !!mintResult.isMeme);
+      setCardUrl(res.cardUrl);
+      setAnnounceResult(res.results);
+    } catch (e) {
+      setAnnounceResult({ error: e.message });
+    } finally {
+      setAnnouncing(false);
+    }
+  };
+
+  const posted = announceResult && Object.values(announceResult).some((r) => r.ok);
+
+  return (
+    <div className="issuance-flow issuance-status">
+      <span className="issuance-success-icon"><Icon name="check" size={28} /></span>
+      <h2 className="section-title">{mintResult.name} is live!</h2>
+      <p className="section-sub">
+        {mintResult.isMeme
+          ? "Minted as a meme coin — no agreement attached."
+          : "Issuer Agreement signed and recorded."}
+      </p>
+      <div className="mint-details">
+        <div className="mint-detail-row">
+          <span className="stat-label">Mint address</span>
+          <span className="stat-value mono">{mintResult.mintAddress}</span>
+        </div>
+        <div className="mint-detail-row">
+          <span className="stat-label">Transaction</span>
+          <span className="stat-value mono">{mintResult.txSignature.slice(0, 20)}…</span>
+        </div>
+        <div className="mint-detail-row">
+          <span className="stat-label">Supply</span>
+          <span className="stat-value">1,000,000 {mintResult.ticker}</span>
+        </div>
+      </div>
+      <a
+        className="btn-secondary"
+        href={`https://explorer.solana.com/address/${mintResult.mintAddress}?cluster=devnet`}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        View on Solana Explorer
+      </a>
+
+      {socialConns.length > 0 && !announceResult && (
+        <div className="announce-section">
+          <h3 className="announce-title">Tell the world</h3>
+          <p className="section-sub">
+            Post your launch to {socialConns.map((c) => c.provider).join(", ")} in one tap.
+          </p>
+          <button className="btn btn-primary" onClick={handleAnnounce} disabled={announcing}>
+            {announcing ? "Posting…" : `Announce $${coin.ticker}`}
+          </button>
+        </div>
+      )}
+      {cardUrl && (
+        <div className="announce-result">
+          <img src={cardUrl} alt="Launch card" className="announce-card-img" />
+          {posted ? (
+            <p className="field-hint">Posted! Check your socials.</p>
+          ) : (
+            <p className="field-hint">
+              Card generated — posting needs the social apps configured on the backend.
+            </p>
+          )}
+        </div>
+      )}
+      {announceResult?.error && <p className="field-hint">{announceResult.error}</p>}
+
+      <button className="link-btn back-link" onClick={onBack} style={{ marginTop: 16 }}>
+        ← Back to Go Live
+      </button>
+    </div>
+  );
+}
+
+function ProvisioningModal({ steps, activeIndex, chainId, name }) {  const isFinalStep = activeIndex === steps.length - 1;
   return (
     <div className="modal-overlay provisioning-overlay">
       <div className="modal-card provisioning-card">
@@ -5046,6 +5108,10 @@ function GlobalStyles() {
       .social-connect-info { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
       .social-connect-label { font-size: 15px; font-weight: 700; }
       .social-connect-detail { font-size: 12.5px; opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .announce-section { margin-top: 24px; padding-top: 20px; border-top: 1px solid rgba(14,165,233,0.15); display: flex; flex-direction: column; gap: 10px; align-items: center; }
+      .announce-title { font-size: 16px; font-weight: 700; margin: 0; }
+      .announce-result { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; align-items: center; }
+      .announce-card-img { width: 220px; height: 220px; border-radius: 16px; box-shadow: 0 12px 32px rgba(2,132,199,0.25); }
       .issuance-choice-tag {
         align-self: flex-start; font-size: 11.5px; font-weight: 600;
         padding: 4px 10px; border-radius: 999px;
