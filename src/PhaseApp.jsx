@@ -62,6 +62,17 @@ const formatCount = (n) => {
   return String(n);
 };
 
+const fundingApi = {
+  getDepositInfo: (userId, chain, currency) => {
+    const q = new URLSearchParams({ userId });
+    if (chain) q.set("chain", chain);
+    if (currency) q.set("currency", currency);
+    return backendFetch(`/funding/deposit-address?${q}`);
+  },
+  getBalances: (userId) =>
+    backendFetch(`/funding/balances?userId=${encodeURIComponent(userId)}`),
+};
+
 /* ============================================================================
    PHASE — Onchain settlement for human, creative, and soft-asset value
    Single-file React prototype. Light-blue glass aesthetic, Φ as living mark.
@@ -3048,148 +3059,232 @@ function BringYourOwnNetworkFlow({ onBack, onPublish }) {
 }
 
 function FundAccountModal({ onClose, onFund }) {
-  const [step, setStep] = useState("method"); // method | details | processing | done
-  const [method, setMethod] = useState(null);
-  const [currencyId, setCurrencyId] = useState("usd");
-  const [amount, setAmount] = useState("");
+  const [step, setStep] = useState("loading"); // loading | deposit | waiting | confirmed | error
+  const [depositInfo, setDepositInfo] = useState(null);
+  const [balances, setBalances] = useState(null);
+  const [chain, setChain] = useState("BASE-SEPOLIA");
+  const [currency, setCurrency] = useState("USDC");
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState(null);
+  const [pollCount, setPollCount] = useState(0);
   const mountedRef = useRef(true);
+  const pollRef = useRef(null);
+
+  const CHAINS = [
+    { id: "BASE-SEPOLIA", label: "Base Sepolia", currencies: ["USDC", "USDT"] },
+    { id: "MATIC-AMOY", label: "Polygon Amoy", currencies: ["USDC", "USDT"] },
+    { id: "SOLANA-DEVNET", label: "Solana Devnet", currencies: ["USDC"] },
+  ];
 
   useEffect(() => {
+    loadDepositInfo();
     return () => {
       mountedRef.current = false;
+      if (pollRef.current) clearInterval(pollRef.current);
     };
   }, []);
 
-  const numericAmount = parseFloat(amount) || 0;
+  useEffect(() => {
+    const c = CHAINS.find((x) => x.id === chain);
+    if (c && !c.currencies.includes(currency)) setCurrency(c.currencies[0]);
+  }, [chain]);
 
-  const goToDetails = (m) => {
-    setMethod(m);
-    setStep("details");
-  };
-
-  const submitFunding = () => {
-    if (numericAmount <= 0) return;
-    setStep("processing");
-    window.setTimeout(() => {
+  const loadDepositInfo = async () => {
+    setStep("loading");
+    setError(null);
+    try {
+      const [dep, bal] = await Promise.all([
+        fundingApi.getDepositInfo("app-user"),
+        fundingApi.getBalances("app-user").catch(() => null),
+      ]);
       if (!mountedRef.current) return;
-      setStep("done");
-    }, 1600);
+      setDepositInfo(dep);
+      setBalances(bal);
+      const firstChain = dep.defaultChain || Object.keys(dep.addresses || {})[0];
+      if (firstChain) setChain(firstChain);
+      setStep("deposit");
+    } catch (e) {
+      if (!mountedRef.current) return;
+      setError(e.message);
+      setStep("error");
+    }
   };
 
-  const finish = () => {
-    onFund(currencyId, numericAmount, FUNDING_METHODS.find((m) => m.id === method)?.label || method);
-    onClose();
+  const copyAddress = async () => {
+    const addr = depositInfo?.addresses?.[chain];
+    if (!addr) return;
+    try {
+      await navigator.clipboard.writeText(addr);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = addr;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+    setCopied(true);
+    setTimeout(() => mountedRef.current && setCopied(false), 2000);
   };
 
-  const selectedMethod = FUNDING_METHODS.find((m) => m.id === method);
+  const startWaiting = () => {
+    setStep("waiting");
+    setPollCount(0);
+    pollRef.current = setInterval(async () => {
+      try {
+        const bal = await fundingApi.getBalances("app-user");
+        if (!mountedRef.current) return;
+        setBalances(bal);
+        setPollCount((n) => n + 1);
+        const credited = parseFloat(bal?.totals?.[currency]?.credited || "0");
+        const pending = parseFloat(bal?.totals?.[currency]?.pending || "0");
+        if (credited > 0 || pending > 0) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          setStep("confirmed");
+          onFund && onFund(currency.toLowerCase(), credited || pending, `${currency} deposit`);
+        }
+      } catch {
+        // keep polling on transient errors
+      }
+    }, 10000);
+  };
+
+  const stopWaiting = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+    setStep("deposit");
+  };
+
+  const address = depositInfo?.addresses?.[chain];
+  const totals = balances?.totals || {};
+  const testnet = depositInfo?.testnet;
+  const chainLabel = (CHAINS.find((c) => c.id === chain) || {}).label || chain;
 
   return (
-    <div className="modal-overlay" onClick={step === "processing" ? undefined : onClose}>
-      <div
-        className={"modal-card fund-modal" + (CRYPTO_FUNDING_LOCKED ? " feature-gated" : "")}
-        onClick={(e) => e.stopPropagation()}
-      >
-        {step !== "processing" && (
-          <button className="icon-btn modal-close" onClick={onClose}>
-            <Icon name="close" size={18} />
-          </button>
-        )}
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card fund-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="icon-btn modal-close" onClick={onClose}>
+          <Icon name="close" size={18} />
+        </button>
 
-        {CRYPTO_FUNDING_LOCKED && (
-          <div className="feature-lock-overlay">
-            <div className="glass-card feature-lock-card">
-              <div className="feature-lock-mark">
-                <Icon name="lock" size={30} />
-              </div>
-              <h3 className="feature-lock-title">Crypto deposits coming soon</h3>
-              <p className="feature-lock-sub">
-                We&apos;re wiring up USDC and USDT deposits. Funding opens as soon as the rails are live.
-              </p>
-            </div>
+        {step === "loading" && (
+          <div className="funding-processing">
+            <span className="spinner spinner-large" />
+            <h3>Setting up your deposit…</h3>
+            <p className="section-sub">Generating your wallet addresses.</p>
           </div>
         )}
-        <div
-          className={CRYPTO_FUNDING_LOCKED ? "feature-locked-blur" : undefined}
-          inert={CRYPTO_FUNDING_LOCKED ? true : undefined}
-          aria-hidden={CRYPTO_FUNDING_LOCKED ? true : undefined}
-        >
 
-        {step === "method" && (
+        {step === "error" && (
+          <div className="funding-processing">
+            <h3>Couldn&apos;t load deposit info</h3>
+            <p className="section-sub">{error || "The funding backend didn&apos;t respond."}</p>
+            <button className="btn btn-secondary" onClick={loadDepositInfo}>Try again</button>
+          </div>
+        )}
+
+        {step === "deposit" && depositInfo && (
           <>
             <h3>Fund Your Account</h3>
-            <p className="section-sub">Add funds with a crypto transfer from your external wallet.</p>
-            <div className="funding-method-grid">
-              {FUNDING_METHODS.map((m) => (
-                <button key={m.id} className="funding-method-btn" onClick={() => goToDetails(m.id)}>
-                  <Icon name={m.icon} size={18} />
-                  <span className="funding-method-label">{m.label}</span>
-                  <span className="funding-method-note">{m.note}</span>
+            <p className="section-sub">
+              Send {currency} from your external wallet to the address below.
+              {testnet ? " Testnet funds — no real money." : ""}
+            </p>
+
+            <label className="field-label">Network</label>
+            <div className="chain-picker">
+              {CHAINS.filter((c) => depositInfo.addresses?.[c.id]).map((c) => (
+                <button
+                  key={c.id}
+                  className={"chain-btn" + (chain === c.id ? " chain-btn-active" : "")}
+                  onClick={() => setChain(c.id)}
+                >
+                  {c.label}
                 </button>
               ))}
             </div>
-          </>
-        )}
-
-        {step === "details" && selectedMethod && (
-          <>
-            <button className="link-btn back-link" onClick={() => setStep("method")}>
-              ← Choose a different method
-            </button>
-            <h3>{selectedMethod.label}</h3>
-            <p className="section-sub">{selectedMethod.note}</p>
 
             <label className="field-label">Currency</label>
-            <CurrencyDropdown currency={currencyId} setCurrency={setCurrencyId} excludeIds={["phase"]} />
+            <div className="chain-picker">
+              {(CHAINS.find((c) => c.id === chain)?.currencies || ["USDC"]).map((cur) => (
+                <button
+                  key={cur}
+                  className={"chain-btn" + (currency === cur ? " chain-btn-active" : "")}
+                  onClick={() => setCurrency(cur)}
+                >
+                  {cur}
+                </button>
+              ))}
+            </div>
 
-            <label className="field-label">Amount</label>
-            <input
-              className="text-input"
-              type="number"
-              placeholder={`Enter an amount in ${currencyId.toUpperCase()}`}
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              autoFocus
-            />
+            <label className="field-label">Your {currency} deposit address ({chainLabel})</label>
+            <div className="deposit-address-box">
+              <span className="deposit-address mono">{address || "—"}</span>
+              <button className="btn btn-ghost btn-sm" onClick={copyAddress} disabled={!address}>
+                {copied ? "Copied!" : "Copy"}
+              </button>
+            </div>
+            <p className="field-hint">
+              Send only {currency} on {chainLabel}. Other assets will not be credited.
+            </p>
 
-            <button
-              className={`btn-primary btn-large btn-full ${numericAmount <= 0 ? "btn-disabled" : ""}`}
-              disabled={numericAmount <= 0}
-              onClick={submitFunding}
-            >
-              Continue
+            {(totals.USDC || totals.USDT) && (
+              <div className="funding-totals">
+                {["USDC", "USDT"].map((cur) => totals[cur] && (
+                  <div key={cur} className="funding-total-row">
+                    <span className="stat-label">{cur}</span>
+                    <span className="stat-value">
+                      {totals[cur].credited} credited
+                      {parseFloat(totals[cur].pending) > 0 && ` \u00b7 ${totals[cur].pending} pending`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <button className="btn btn-primary btn-large btn-full" onClick={startWaiting} disabled={!address}>
+              I&apos;ve sent funds
             </button>
           </>
         )}
 
-        {step === "processing" && (
+        {step === "waiting" && (
           <div className="funding-processing">
             <span className="spinner spinner-large" />
-            <h3>Processing your funding request...</h3>
+            <h3>Watching for your deposit…</h3>
             <p className="section-sub">
-              {`Confirming your ${selectedMethod?.label || "transfer"}...`}
+              We&apos;re monitoring the blockchain for incoming {currency}. This usually takes
+              under a minute on testnet. You can close this and come back — your funds are safe.
             </p>
+            <p className="field-hint">Checked {pollCount} time{pollCount === 1 ? "" : "s"}</p>
+            <button className="btn btn-ghost" onClick={stopWaiting}>Back to address</button>
           </div>
         )}
 
-        {step === "done" && (
+        {step === "confirmed" && (
           <div className="funding-done">
             <div className="funding-done-icon">
               <Icon name="check" size={22} />
             </div>
-            <h3>Funds added</h3>
+            <h3>Deposit detected!</h3>
             <p className="section-sub">
-              {amount} {currencyId.toUpperCase()} has been added to your Phase cash account via {selectedMethod?.label}.
+              {totals[currency]?.credited && parseFloat(totals[currency].credited) > 0
+                ? `${totals[currency].credited} ${currency} credited to your account.`
+                : `${totals[currency]?.pending || ""} ${currency} incoming — confirming on-chain now.`}
             </p>
-            <button className="btn-primary btn-large btn-full" onClick={finish}>
+            <button className="btn btn-primary" onClick={onClose}>
               Done
             </button>
           </div>
         )}
-        </div>
       </div>
     </div>
   );
 }
+
 
 function EquitySplitSlider({ equityPublic, setEquityPublic }) {
   return (
@@ -5112,6 +5207,24 @@ function GlobalStyles() {
       .announce-title { font-size: 16px; font-weight: 700; margin: 0; }
       .announce-result { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; align-items: center; }
       .announce-card-img { width: 220px; height: 220px; border-radius: 16px; box-shadow: 0 12px 32px rgba(2,132,199,0.25); }
+      .chain-picker { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 16px; }
+      .chain-btn {
+        padding: 10px 16px; border-radius: 12px; cursor: pointer;
+        background: rgba(255,255,255,0.5); border: 1.5px solid rgba(14,165,233,0.2);
+        font: inherit; font-size: 13.5px; font-weight: 600; color: inherit;
+        transition: border-color 0.15s ease, background 0.15s ease;
+      }
+      .chain-btn-active {
+        border-color: rgba(14,165,233,0.7); background: rgba(14,165,233,0.12); color: #0284c7;
+      }
+      .deposit-address-box {
+        display: flex; align-items: center; gap: 10px;
+        padding: 14px; border-radius: 12px; margin: 8px 0;
+        background: rgba(2,132,199,0.06); border: 1.5px dashed rgba(14,165,233,0.35);
+      }
+      .deposit-address { flex: 1; font-size: 12px; word-break: break-all; line-height: 1.5; }
+      .funding-totals { margin: 16px 0; padding: 12px 16px; border-radius: 12px; background: rgba(255,255,255,0.4); }
+      .funding-total-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13.5px; }
       .issuance-choice-tag {
         align-self: flex-start; font-size: 11.5px; font-weight: 600;
         padding: 4px 10px; border-radius: 999px;
