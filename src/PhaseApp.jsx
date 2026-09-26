@@ -1818,12 +1818,13 @@ function GoLiveTab({ onPublish }) {
   const [businessLegalName, setBusinessLegalName] = useState("");
   const [equityPublic, setEquityPublic] = useState(20);
   const [startingPrice, setStartingPrice] = useState(10);
+  const [totalShares, setTotalShares] = useState(100000);
   const [published, setPublished] = useState(null);
 
   const equityRetained = 100 - equityPublic;
   const compliance = COMPLIANCE_META[ASSET_CATEGORIES[category].complianceClass];
-  const publicShares = Math.round(SOVEREIGN_TOTAL_SHARES * (equityPublic / 100));
-  const retainedShares = SOVEREIGN_TOTAL_SHARES - publicShares;
+  const publicShares = Math.round(totalShares * (equityPublic / 100));
+  const retainedShares = totalShares - publicShares;
 
   const choosePath = (pathKey) => {
     setSelectedPath(pathKey);
@@ -1909,7 +1910,8 @@ function GoLiveTab({ onPublish }) {
     consented &&
     hasDocumentation &&
     businessAttestationDone &&
-    startingPrice > 0;
+    startingPrice > 0 &&
+    totalShares >= 1000;
 
 
 
@@ -1967,6 +1969,9 @@ function GoLiveTab({ onPublish }) {
             },
             equityPublic,
             startingPrice,
+            totalShares,
+            publicShares,
+            retainedShares,
             mintAddress: mintedCoin.mintAddress,
             txSignature: mintedCoin.txSignature,
           });
@@ -2260,8 +2265,21 @@ function GoLiveTab({ onPublish }) {
         </p>
 
         <label className="field-label">Fractionalization &amp; Sovereign Split</label>
+        <label className="field-label" htmlFor="total-shares" style={{ marginTop: 4 }}>
+          Total shares to issue
+        </label>
+        <input
+          id="total-shares"
+          className="text-input"
+          type="number"
+          min="1000"
+          step="1000"
+          placeholder="100,000"
+          value={totalShares}
+          onChange={(e) => setTotalShares(Math.max(1000, parseInt(e.target.value, 10) || 1000))}
+        />
         <p className="field-hint">
-          {SOVEREIGN_TOTAL_SHARES.toLocaleString()} fractional shares mint at genesis. Set how many go to
+          {totalShares.toLocaleString()} fractional shares mint at genesis. Set how many go to
           the public float vs. what you retain — it's entirely up to you.
         </p>
         <EquitySplitSlider
