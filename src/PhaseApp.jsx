@@ -39,6 +39,25 @@ const issuanceApi = {
     }),
 };
 
+const socialApi = {
+  getProviders: () => backendFetch("/social/providers"),
+  getAuthorizeUrl: (provider, userId) =>
+    backendFetch(`/social/${provider}/authorize?userId=${encodeURIComponent(userId)}`),
+  getConnections: (userId) =>
+    backendFetch(`/social/connections?userId=${encodeURIComponent(userId)}`),
+  disconnect: (provider, userId) =>
+    backendFetch(`/social/${provider}`, { method: "DELETE", body: { userId } }),
+};
+
+// Compact number formatting: 1234 -> "1.2K", 2500000 -> "2.5M"
+const formatCount = (n) => {
+  if (n == null) return "—";
+  if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, "") + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
+  return String(n);
+};
+
 /* ============================================================================
    PHASE — Onchain settlement for human, creative, and soft-asset value
    Single-file React prototype. Light-blue glass aesthetic, Φ as living mark.
@@ -1081,6 +1100,15 @@ function Icon({ name, size = 18 }) {
         <svg {...common}>
           <circle cx="12" cy="8" r="3.4" stroke="currentColor" strokeWidth="1.6" />
           <path d="M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      );
+    case "social":
+      return (
+        <svg {...common}>
+          <circle cx="7" cy="12" r="3" stroke="currentColor" strokeWidth="1.6" />
+          <circle cx="17" cy="6" r="2.4" stroke="currentColor" strokeWidth="1.6" />
+          <circle cx="17" cy="18" r="2.4" stroke="currentColor" strokeWidth="1.6" />
+          <path d="M9.6 10.8l4.8-3.6M9.6 13.2l4.8 3.6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
         </svg>
       );
     case "hard":
@@ -2249,7 +2277,11 @@ function GoLiveTab({ onPublish }) {
 // Uses the real Phase backend. The agreement creates a covenant between the
 // issuer and purchasers; the meme path explicitly mints with no agreement.
 function IssuanceFlow({ coin, onBack, onComplete }) {
-  const [step, setStep] = useState("choice"); // choice | agreement | meme | minting | done | error
+  const [step, setStep] = useState("choice"); // choice | social | agreement | meme | minting | done | error
+  const [chosenPath, setChosenPath] = useState(null); // "agreement" | "meme"
+  const [socialProviders, setSocialProviders] = useState([]);
+  const [socialConns, setSocialConns] = useState([]);
+  const [socialLoading, setSocialLoading] = useState(false);
   const [draftId, setDraftId] = useState(null);
   const [agreementText, setAgreementText] = useState("");
   const [agreementHash, setAgreementHash] = useState("");
@@ -2289,24 +2321,81 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
   const chooseAgreement = async () => {
     const id = draftId || (await startDraft());
     if (!id) return;
-    setBusy(true);
-    try {
-      const ag = await issuanceApi.getAgreement(id);
-      setAgreementText(ag.agreementText);
-      setAgreementHash(ag.agreementHash);
-      setStep("agreement");
-    } catch (e) {
-      setError(e.message);
-      setStep("error");
-    } finally {
-      setBusy(false);
-    }
+    setChosenPath("agreement");
+    setStep("social");
+    loadSocial();
   };
 
   const chooseMeme = async () => {
     const id = draftId || (await startDraft());
     if (!id) return;
-    setStep("meme");
+    setChosenPath("meme");
+    setStep("social");
+    loadSocial();
+  };
+
+  const loadSocial = async () => {
+    setSocialLoading(true);
+    try {
+      const [prov, conns] = await Promise.all([
+        socialApi.getProviders().catch(() => ({ providers: [] })),
+        socialApi.getConnections("app-user").catch(() => ({ connections: [] })),
+      ]);
+      setSocialProviders(prov.providers || []);
+      setSocialConns(conns.connections || []);
+    } finally {
+      setSocialLoading(false);
+    }
+  };
+
+  const connectSocial = async (provider) => {
+    setSocialLoading(true);
+    try {
+      const { authorizeUrl } = await socialApi.getAuthorizeUrl(provider, "app-user");
+      // Open OAuth in system browser; backend callback stores the connection.
+      window.open(authorizeUrl, "_blank");
+      // Poll for the new connection (user completes OAuth in browser)
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const { connections } = await socialApi.getConnections("app-user").catch(() => ({ connections: [] }));
+        if (connections.some((c) => c.provider === provider)) {
+          setSocialConns(connections);
+          break;
+        }
+      }
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSocialLoading(false);
+    }
+  };
+
+  const disconnectSocial = async (provider) => {
+    try {
+      await socialApi.disconnect(provider, "app-user");
+      setSocialConns(socialConns.filter((c) => c.provider !== provider));
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  const continueFromSocial = async () => {
+    if (chosenPath === "agreement") {
+      setBusy(true);
+      try {
+        const ag = await issuanceApi.getAgreement(draftId);
+        setAgreementText(ag.agreementText);
+        setAgreementHash(ag.agreementHash);
+        setStep("agreement");
+      } catch (e) {
+        setError(e.message);
+        setStep("error");
+      } finally {
+        setBusy(false);
+      }
+    } else {
+      setStep("meme");
+    }
   };
 
   const signAndMint = async () => {
@@ -2392,6 +2481,69 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
           </button>
         </div>
         {busy && <p className="field-hint">Preparing your coin draft…</p>}
+      </div>
+    );
+  }
+
+  if (step === "social") {
+    const connectedMap = Object.fromEntries(socialConns.map((c) => [c.provider, c]));
+    return (
+      <div className="issuance-flow">
+        <button className="link-btn back-link" onClick={() => setStep("choice")}>
+          ← Back to issuance options
+        </button>
+        <h2 className="section-title">Link your socials</h2>
+        <p className="section-sub">
+          Verify who you are. Connected accounts show on your coin's profile with real
+          follower counts — no fake badges. Optional, but serious issuers link up.
+        </p>
+        <div className="social-connect-list">
+          {socialLoading && socialProviders.length === 0 && (
+            <p className="field-hint">Loading social providers…</p>
+          )}
+          {socialProviders.map((p) => {
+            const conn = connectedMap[p.provider];
+            return (
+              <div key={p.provider} className="social-connect-row">
+                <span className="social-connect-icon"><Icon name="social" size={20} /></span>
+                <span className="social-connect-info">
+                  <span className="social-connect-label">{p.label}</span>
+                  {conn ? (
+                    <span className="social-connect-detail">
+                      @{conn.username}{conn.followerCount != null ? ` · ${formatCount(conn.followerCount)} followers` : ""}
+                    </span>
+                  ) : (
+                    <span className="social-connect-detail">
+                      {p.configured ? "Not connected" : "Coming soon"}
+                    </span>
+                  )}
+                </span>
+                {conn ? (
+                  <button className="btn btn-ghost btn-sm" onClick={() => disconnectSocial(p.provider)}>
+                    Disconnect
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    disabled={!p.configured || socialLoading}
+                    onClick={() => connectSocial(p.provider)}
+                  >
+                    {socialLoading ? "Waiting…" : "Connect"}
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        {socialLoading && <p className="field-hint">Complete the login in your browser, then come back here…</p>}
+        <div className="form-actions">
+          <button className="btn btn-primary" onClick={continueFromSocial} disabled={busy || socialLoading}>
+            Continue{socialConns.length > 0 ? ` (${socialConns.length} linked)` : ""}
+          </button>
+          <button className="link-btn" onClick={continueFromSocial} disabled={busy}>
+            Skip for now
+          </button>
+        </div>
       </div>
     );
   }
@@ -4880,6 +5032,20 @@ function GlobalStyles() {
       }
       .issuance-choice-title { font-size: 17px; font-weight: 700; }
       .issuance-choice-desc { font-size: 13.5px; line-height: 1.55; opacity: 0.82; }
+      .social-connect-list { display: flex; flex-direction: column; gap: 12px; margin-top: 20px; }
+      .social-connect-row {
+        display: flex; align-items: center; gap: 14px;
+        padding: 14px 16px; border-radius: 14px;
+        background: rgba(255,255,255,0.55); border: 1.5px solid rgba(14,165,233,0.2);
+      }
+      .social-connect-icon {
+        width: 40px; height: 40px; border-radius: 10px; flex-shrink: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: rgba(14,165,233,0.12); color: #0284c7;
+      }
+      .social-connect-info { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+      .social-connect-label { font-size: 15px; font-weight: 700; }
+      .social-connect-detail { font-size: 12.5px; opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .issuance-choice-tag {
         align-self: flex-start; font-size: 11.5px; font-weight: 600;
         padding: 4px 10px; border-radius: 999px;
