@@ -1332,8 +1332,9 @@ export default function App() {
     return () => clearInterval(t);
   }, [refreshFundingStatus]);
 
-  // Dashboard unlocks when the user has real funds OR has issued their own coin
-  const dashboardUnlocked = cryptoFunded || hasIssuedCoin;
+  // Dashboard gate lifted for now — show the full interface so we can see it.
+  // Re-enable with: const dashboardUnlocked = cryptoFunded || hasIssuedCoin;
+  const dashboardUnlocked = true;
 
   // In-app update check — once per launch, silent unless a newer GitHub
   // release exists and this version wasn't snoozed.
