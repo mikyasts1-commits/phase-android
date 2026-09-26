@@ -2,6 +2,43 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import { checkForUpdates, dismissUpdate, UpdateDialog } from "./update-check.jsx";
 import { MARKETPLACE_LOCKED, CRYPTO_FUNDING_LOCKED, GO_LIVE_LOCKED, DASHBOARD_LOCKED } from "./feature-flags.js";
 
+/* ------------------------- Phase backend API client ------------------------- */
+// Real backend: issuance (draft → agreement → sign → mint) and funding.
+const PHASE_BACKEND_URL = "https://phase-backend.onrender.com/api/v1";
+
+async function backendFetch(path, { method = "GET", body, idempotencyKey } = {}) {
+  const headers = { "Content-Type": "application/json" };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  const res = await fetch(`${PHASE_BACKEND_URL}${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.message || data.error || `Backend error ${res.status}`);
+    err.code = data.error || data.code;
+    err.status = res.status;
+    err.detail = data;
+    throw err;
+  }
+  return data;
+}
+
+const issuanceApi = {
+  createDraft: (draft) => backendFetch("/issuance/draft", { method: "POST", body: draft }),
+  getAgreement: (draftId) =>
+    backendFetch(`/issuance/agreement?draftId=${encodeURIComponent(draftId)}`),
+  signAgreement: (draftId, legalName) =>
+    backendFetch("/issuance/sign", { method: "POST", body: { draftId, legalName, accepted: true } }),
+  mint: (draftId, { meme = false, idempotencyKey } = {}) =>
+    backendFetch("/issuance/mint", {
+      method: "POST",
+      body: { draftId, meme },
+      idempotencyKey: idempotencyKey || `mint-${draftId}-${Date.now()}`,
+    }),
+};
+
 /* ============================================================================
    PHASE — Onchain settlement for human, creative, and soft-asset value
    Single-file React prototype. Light-blue glass aesthetic, Φ as living mark.
@@ -1692,7 +1729,7 @@ function ConfettiBurst() {
 /* =============================== GO LIVE TAB ================================ */
 
 function GoLiveTab({ onPublish }) {
-  const [flowStep, setFlowStep] = useState("entry"); // entry | bringYourOwn | form
+  const [flowStep, setFlowStep] = useState("entry"); // entry | bringYourOwn | form | issuance
   const [selectedPath, setSelectedPath] = useState(null); // 'capital' | 'business' | 'asset'
   const [selectedExample, setSelectedExample] = useState(null); // example object from GOLIVE_PATHS, or null for "describe my own"
   const [usingOwnThesis, setUsingOwnThesis] = useState(false);
@@ -1700,6 +1737,7 @@ function GoLiveTab({ onPublish }) {
   const [category, setCategory] = useState("socialMedia");
   const [subsection, setSubsection] = useState(ASSET_CATEGORIES.socialMedia.subsections[0]);
   const [name, setName] = useState("");
+  const [ticker, setTicker] = useState("");
   const [tagline, setTagline] = useState("");
   const [platform, setPlatform] = useState("YouTube");
   const [followers, setFollowers] = useState("");
@@ -1708,19 +1746,11 @@ function GoLiveTab({ onPublish }) {
   const [verifyState, setVerifyState] = useState("idle"); // idle | checking | verified | mismatch
   const [lookupResult, setLookupResult] = useState(null);
   const [socialProfiles, setSocialProfiles] = useState([]); // linked social accounts: [{ platform, url, followers, engagement, verified }]
-  const [docChoice, setDocChoice] = useState(null); // 'own' | 'generate'
-  const [docFile, setDocFile] = useState(null);
-  const [licenseNumber, setLicenseNumber] = useState("");
-  const [ownerName, setOwnerName] = useState("");
-  const [signatureName, setSignatureName] = useState("");
-  const [signatureAgreed, setSignatureAgreed] = useState(false);
-  const [showGeneratedAgreement, setShowGeneratedAgreement] = useState(false);
   const [showTerms, setShowTerms] = useState(false);
   const [consented, setConsented] = useState(false);
   const [equityPublic, setEquityPublic] = useState(20);
   const [startingPrice, setStartingPrice] = useState(10);
   const [published, setPublished] = useState(null);
-  const [provisioning, setProvisioning] = useState(false);
 
   const equityRetained = 100 - equityPublic;
   const compliance = COMPLIANCE_META[ASSET_CATEGORIES[category].complianceClass];
@@ -1766,14 +1796,6 @@ function GoLiveTab({ onPublish }) {
     };
   }, []);
 
-  const generatedAgreementText = generateAgreementText({
-    ownerName,
-    listingName: name,
-    valueThesis: tagline,
-    equityPublic,
-    equityRetained,
-    docLabel: compliance.docLabel,
-  });
 
   // Lock the current platform + URL into the linked-profiles list so an
   // issuer can attach several social accounts; each renders as a clickable
@@ -1805,84 +1827,17 @@ function GoLiveTab({ onPublish }) {
   // chain doesn't require pre-existing paperwork. If someone chose "generate
   // a charter," we still ask for a name + signature so the charter reads
   // correctly, but it's not a hard gate.
-  const hasDocumentation =
-    docChoice === "own"
-      ? true
-      : docChoice === "generate"
-      ? signatureAgreed && signatureName.trim().length > 1
-      : true;
+  const hasDocumentation = true; // real agreement handled in the issuance flow
 
   const canPublish =
-    name.trim().length > 1 && tagline.trim().length > 3 && consented && hasDocumentation && startingPrice > 0;
+    name.trim().length > 1 &&
+    ticker.trim().length >= 2 &&
+    tagline.trim().length > 3 &&
+    consented &&
+    hasDocumentation &&
+    startingPrice > 0;
 
-  // The reveal sequence a person watches while their chain provisions.
-  // Purely presentational timing — the actual asset object is created
-  // once, after the sequence finishes, in the final setTimeout below.
-  const PROVISION_STEPS = [
-    "Assigning sovereign chain ID...",
-    "Minting 1,000,000 shares...",
-    "Writing genesis block...",
-    "Opening isolated ledger...",
-  ];
-  const [provisionStepIndex, setProvisionStepIndex] = useState(0);
-  const [revealedChainId, setRevealedChainId] = useState(null);
 
-  const handlePublish = () => {
-    if (!canPublish) return;
-    setProvisioning(true);
-    setProvisionStepIndex(0);
-    const chainId = generateChainId();
-    setRevealedChainId(chainId);
-
-    const stepDelay = 550;
-    PROVISION_STEPS.forEach((_, i) => {
-      window.setTimeout(() => setProvisionStepIndex(i), i * stepDelay);
-    });
-
-    window.setTimeout(() => {
-      // Include a typed-but-not-yet-added profile so nothing the issuer entered is lost.
-      const pendingProfile =
-        socialUrl.trim().length >= 5
-          ? [
-              {
-                platform,
-                url: socialUrl.trim(),
-                followers: followers.trim(),
-                engagement: engagement.trim(),
-                verified: false,
-              },
-            ]
-          : [];
-      const asset = onPublish({
-        name,
-        category,
-        subsection,
-        tagline,
-        platform,
-        followers,
-        engagement,
-        socialUrl,
-        socialProfiles: [...socialProfiles, ...pendingProfile],
-        verification: {
-          status: "unverified", // no social verification exists yet
-          lookupFollowers: null,
-          lookupEngagement: null,
-        },
-        compliance: {
-          docFileName: docChoice === "own" ? (docFile ? docFile.name : null) : "Sovereign Chain Charter (generated)",
-          licenseNumber: docChoice === "own" ? licenseNumber || null : null,
-          generatedAgreement: docChoice === "generate" ? generatedAgreementText : null,
-          signature: docChoice === "generate" ? { name: signatureName, agreedAt: new Date().toISOString() } : null,
-          consented,
-        },
-        equityPublic,
-        startingPrice,
-        chainIdOverride: chainId, // keep the ID the person watched get "assigned" in sync with the real asset
-      });
-      setProvisioning(false);
-      setPublished(asset);
-    }, PROVISION_STEPS.length * stepDelay + 500); // small pause on the final step before resolving
-  };
 
   if (flowStep === "entry") {
     return (
@@ -1901,6 +1856,48 @@ function GoLiveTab({ onPublish }) {
       <BringYourOwnNetworkFlow
         onBack={() => setFlowStep("entry")}
         onPublish={onPublish}
+      />
+    );
+  }
+
+  if (flowStep === "issuance") {
+    return (
+      <IssuanceFlow
+        coin={{
+          name: name.trim(),
+          ticker: ticker.trim(),
+          tagline: tagline.trim(),
+          category,
+          equityPublic,
+          equityRetained,
+        }}
+        onBack={() => setFlowStep("form")}
+        onComplete={(mintedCoin, isMeme) => {
+          // Hand the real minted coin to the parent for dashboard unlock.
+          const asset = onPublish({
+            name: mintedCoin.name,
+            category,
+            subsection,
+            tagline: tagline.trim(),
+            socialProfiles,
+            verification: { status: "unverified", lookupFollowers: null, lookupEngagement: null },
+            compliance: {
+              docFileName: isMeme ? null : "Issuer Agreement (digitally signed)",
+              generatedAgreement: null,
+              signature: null,
+              issuanceCoinId: mintedCoin.id,
+              mintAddress: mintedCoin.mintAddress,
+              txSignature: mintedCoin.txSignature,
+              isMeme,
+              consented,
+            },
+            equityPublic,
+            startingPrice,
+            mintAddress: mintedCoin.mintAddress,
+            txSignature: mintedCoin.txSignature,
+          });
+          setPublished(asset);
+        }}
       />
     );
   }
@@ -1969,6 +1966,20 @@ function GoLiveTab({ onPublish }) {
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
+
+        <label className="field-label" htmlFor="asset-ticker">
+          Ticker symbol
+        </label>
+        <input
+          id="asset-ticker"
+          className="text-input"
+          placeholder="e.g. MYC"
+          maxLength={10}
+          value={ticker}
+          onChange={(e) => setTicker(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
+          style={{ maxWidth: 160, textTransform: "uppercase" }}
+        />
+        <p className="field-hint">2–10 characters, letters and numbers only. This is your coin's on-chain symbol.</p>
 
         <label className="field-label" htmlFor="asset-tagline">
           {usingOwnThesis ? "Describe your value thesis" : "How do you add value to society?"}
@@ -2070,127 +2081,6 @@ function GoLiveTab({ onPublish }) {
           </>
         )}
 
-        <label className="field-label">Compliance &amp; Documentation</label>
-        <div className="compliance-block">
-          <p className="compliance-hint">{compliance.docHint}</p>
-
-          <label className="field-label field-label-sub">Do you already have a {compliance.docLabel.toLowerCase()}?</label>
-          <div className="doc-choice-row">
-            <button
-              className={`doc-choice-btn ${docChoice === "own" ? "doc-choice-btn-active" : ""}`}
-              onClick={() => setDocChoice("own")}
-            >
-              <Icon name="soft" size={16} />
-              <span>Yes, I have my own document</span>
-            </button>
-            <button
-              className={`doc-choice-btn ${docChoice === "generate" ? "doc-choice-btn-active" : ""}`}
-              onClick={() => setDocChoice("generate")}
-            >
-              <Icon name="check" size={16} />
-              <span>No — generate one for me to sign</span>
-            </button>
-          </div>
-
-          {docChoice === "own" && (
-            <>
-              <label className="field-label field-label-sub" htmlFor="doc-upload">
-                {compliance.docLabel}
-              </label>
-              <div className="file-upload-row">
-                <label className="file-upload-btn" htmlFor="doc-upload">
-                  <Icon name="soft" size={15} />
-                  {docFile ? docFile.name : "Upload document (PDF or image)"}
-                </label>
-                <input
-                  id="doc-upload"
-                  type="file"
-                  accept=".pdf,.png,.jpg,.jpeg"
-                  style={{ display: "none" }}
-                  onChange={(e) => setDocFile(e.target.files && e.target.files[0] ? e.target.files[0] : null)}
-                />
-                {docFile && (
-                  <button className="icon-btn" onClick={() => setDocFile(null)} title="Remove file">
-                    <Icon name="close" size={14} />
-                  </button>
-                )}
-              </div>
-
-              <label className="field-label field-label-sub" htmlFor="license-number">
-                {compliance.licenseLabel}
-              </label>
-              <input
-                id="license-number"
-                className="text-input"
-                placeholder="Enter a reference number, or upload a document above instead"
-                value={licenseNumber}
-                onChange={(e) => setLicenseNumber(e.target.value)}
-              />
-            </>
-          )}
-
-          {docChoice === "generate" && (
-            <div className="generate-agreement-block">
-              <p className="compliance-hint">
-                Phase will generate an <strong>Issuer Agreement</strong> from the information you've entered
-                above — a contractual commitment to everyone who purchases your coin, covering who you are,
-                the accuracy of your statements, and how value is shared. Optional, not required to issue
-                your chain.
-              </p>
-
-              <label className="field-label field-label-sub" htmlFor="owner-name">
-                Your full legal name
-              </label>
-              <input
-                id="owner-name"
-                className="text-input"
-                placeholder="As it should appear on the charter"
-                value={ownerName}
-                onChange={(e) => setOwnerName(e.target.value)}
-              />
-
-              <div className="agreement-preview-row">
-                <button
-                  className="link-btn"
-                  onClick={() => setShowGeneratedAgreement(true)}
-                  disabled={!name.trim() || !tagline.trim()}
-                >
-                  Preview the generated agreement
-                </button>
-                <a
-                  className="link-btn agreement-pdf-inline"
-                  href="docs/phase-issuer-agreement.pdf"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <Icon name="soft" size={13} /> Issuer Agreement (PDF)
-                </a>
-              </div>
-
-              <label className="field-label field-label-sub" htmlFor="signature-name">
-                Sign by typing your full name
-              </label>
-              <input
-                id="signature-name"
-                className="text-input signature-input"
-                placeholder="Type your full name to sign"
-                value={signatureName}
-                onChange={(e) => setSignatureName(e.target.value)}
-              />
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={signatureAgreed}
-                  onChange={(e) => setSignatureAgreed(e.target.checked)}
-                />
-                <span>
-                  I, {signatureName || "[your name]"}, have read the generated Issuer Agreement and
-                  confirm it accurately reflects my coin's parameters and my commitments to purchasers.
-                </span>
-              </label>
-            </div>
-          )}
-
           <div className="consent-row">
             <label className="checkbox-row">
               <input
@@ -2208,7 +2098,6 @@ function GoLiveTab({ onPublish }) {
               </span>
             </label>
           </div>
-        </div>
 
         <label className="field-label" htmlFor="starting-price">
           Starting Share Price
@@ -2260,15 +2149,15 @@ function GoLiveTab({ onPublish }) {
         </div>
 
         <button
-          className={`btn-primary btn-large btn-pulse ${!canPublish || provisioning ? "btn-disabled" : ""}`}
-          onClick={handlePublish}
-          disabled={!canPublish || provisioning}
+          className={`btn-primary btn-large btn-pulse ${!canPublish ? "btn-disabled" : ""}`}
+          onClick={() => setFlowStep("issuance")}
+          disabled={!canPublish}
         >
-          {provisioning ? "Provisioning..." : "Issue My Chain"}
+          Continue to Issuance →
         </button>
-        {!canPublish && !provisioning && (
+        {!canPublish && (
           <p className="field-hint">
-            Add a name, a value description, a starting price, and agree to the terms to continue.
+            Add a name, ticker, value description, starting price, and agree to the terms to continue.
           </p>
         )}
 
@@ -2281,15 +2170,6 @@ function GoLiveTab({ onPublish }) {
           </div>
         )}
       </section>
-
-      {provisioning && (
-        <ProvisioningModal
-          steps={PROVISION_STEPS}
-          activeIndex={provisionStepIndex}
-          chainId={revealedChainId}
-          name={name}
-        />
-      )}
 
       <section className="glass-card golive-preview">
         <span className="preview-label">Live preview — your sovereign chain</span>
@@ -2316,13 +2196,6 @@ function GoLiveTab({ onPublish }) {
             {tagline || "Your value-addition description will appear here."}
           </p>
 
-          <div className="preview-badges-row">
-            {consented && (docFile || licenseNumber) && (
-              <span className="badge badge-compliant">
-                <Icon name="check" size={11} /> Documentation on File
-              </span>
-            )}
-          </div>
 
           {ASSET_CATEGORIES[category].usesSocialProof && (
             <div className="preview-stats">
@@ -2363,12 +2236,6 @@ function GoLiveTab({ onPublish }) {
       </section>
 
       {showTerms && <TermsModal onClose={() => setShowTerms(false)} />}
-      {showGeneratedAgreement && (
-        <GeneratedAgreementModal
-          text={generatedAgreementText}
-          onClose={() => setShowGeneratedAgreement(false)}
-        />
-      )}
     </div>
   );
 }
@@ -2377,6 +2244,317 @@ function GoLiveTab({ onPublish }) {
 // provisions — steps light up in sequence, ending with the chain ID
 // animating in large. This is the emotional high point of Go Live, so it
 // gets its own beat instead of a generic spinner.
+/* ------------------------- Real issuance flow ------------------------- */
+// Draft → choice (Issuer Agreement vs Meme Coin) → sign → mint on Solana devnet.
+// Uses the real Phase backend. The agreement creates a covenant between the
+// issuer and purchasers; the meme path explicitly mints with no agreement.
+function IssuanceFlow({ coin, onBack, onComplete }) {
+  const [step, setStep] = useState("choice"); // choice | agreement | meme | minting | done | error
+  const [draftId, setDraftId] = useState(null);
+  const [agreementText, setAgreementText] = useState("");
+  const [agreementHash, setAgreementHash] = useState("");
+  const [legalName, setLegalName] = useState("");
+  const [accepted, setAccepted] = useState(false);
+  const [memeConfirmed, setMemeConfirmed] = useState(false);
+  const [mintResult, setMintResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const idempotencyKey = useRef(`app-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+
+  const startDraft = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const draft = await issuanceApi.createDraft({
+        userId: "app-user",
+        name: coin.name,
+        ticker: coin.ticker,
+        category: coin.category || "Creator",
+        tagline: coin.tagline,
+        valueThesis: coin.tagline,
+        equityPublic: coin.equityPublic,
+        equityRetained: coin.equityRetained,
+      });
+      setDraftId(draft.draftId);
+      return draft.draftId;
+    } catch (e) {
+      setError(e.message);
+      setStep("error");
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const chooseAgreement = async () => {
+    const id = draftId || (await startDraft());
+    if (!id) return;
+    setBusy(true);
+    try {
+      const ag = await issuanceApi.getAgreement(id);
+      setAgreementText(ag.agreementText);
+      setAgreementHash(ag.agreementHash);
+      setStep("agreement");
+    } catch (e) {
+      setError(e.message);
+      setStep("error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const chooseMeme = async () => {
+    const id = draftId || (await startDraft());
+    if (!id) return;
+    setStep("meme");
+  };
+
+  const signAndMint = async () => {
+    if (!legalName.trim() || legalName.trim().length < 2 || !accepted) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await issuanceApi.signAgreement(draftId, legalName.trim());
+      setStep("minting");
+      const result = await issuanceApi.mint(draftId, {
+        meme: false,
+        idempotencyKey: idempotencyKey.current,
+      });
+      setMintResult(result.coin);
+      setStep("done");
+      onComplete && onComplete(result.coin, false);
+    } catch (e) {
+      setError(e.message);
+      setStep("error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const mintMeme = async () => {
+    if (!memeConfirmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setStep("minting");
+      const result = await issuanceApi.mint(draftId, {
+        meme: true,
+        idempotencyKey: idempotencyKey.current,
+      });
+      setMintResult(result.coin);
+      setStep("done");
+      onComplete && onComplete(result.coin, true);
+    } catch (e) {
+      setError(e.message);
+      setStep("error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (step === "choice") {
+    return (
+      <div className="issuance-flow">
+        <button className="link-btn back-link" onClick={onBack}>
+          ← Back to coin details
+        </button>
+        <h2 className="section-title">How do you want to issue {coin.name}?</h2>
+        <p className="section-sub">
+          {coin.ticker} · {coin.equityPublic}% public / {coin.equityRetained}% retained · 1,000,000 shares on Solana devnet
+        </p>
+        <div className="issuance-choice-grid">
+          <button
+            className="issuance-choice-card"
+            onClick={chooseAgreement}
+            disabled={busy}
+          >
+            <span className="issuance-choice-icon"><Icon name="check" size={22} /></span>
+            <span className="issuance-choice-title">Sign the Issuer Agreement</span>
+            <span className="issuance-choice-desc">
+              Create a binding covenant with everyone who buys your coin. You represent who you
+              are, warrant your statements are accurate, and commit to sharing value with
+              purchasers. Signed digitally with your legal name.
+            </span>
+            <span className="issuance-choice-tag">Recommended for serious projects</span>
+          </button>
+          <button
+            className="issuance-choice-card issuance-choice-meme"
+            onClick={chooseMeme}
+            disabled={busy}
+          >
+            <span className="issuance-choice-icon"><Icon name="soft" size={22} /></span>
+            <span className="issuance-choice-title">Mint as a Meme Coin</span>
+            <span className="issuance-choice-desc">
+              No agreement, no representations, no promises. Just a fun coin with no covenant
+              attached — purchasers get exactly what's on the tin: a meme.
+            </span>
+            <span className="issuance-choice-tag">No strings attached</span>
+          </button>
+        </div>
+        {busy && <p className="field-hint">Preparing your coin draft…</p>}
+      </div>
+    );
+  }
+
+  if (step === "agreement") {
+    const canSign = legalName.trim().length >= 2 && accepted && !busy;
+    return (
+      <div className="issuance-flow">
+        <button className="link-btn back-link" onClick={() => setStep("choice")}>
+          ← Back to issuance options
+        </button>
+        <h2 className="section-title">Issuer Agreement</h2>
+        <p className="section-sub">
+          This covenant is made for the benefit of everyone who purchases {coin.ticker}. Read it
+          carefully — your digital signature binds you to it.
+        </p>
+        <div className="agreement-doc">
+          <pre className="agreement-text">{agreementText}</pre>
+        </div>
+        {agreementHash && (
+          <p className="field-hint">Document hash: {agreementHash.slice(0, 16)}…</p>
+        )}
+        <label className="field-label" htmlFor="issuance-legal-name">
+          Your full legal name
+        </label>
+        <input
+          id="issuance-legal-name"
+          className="text-input signature-input"
+          placeholder="Type your full legal name to sign"
+          value={legalName}
+          onChange={(e) => setLegalName(e.target.value)}
+        />
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={accepted}
+            onChange={(e) => setAccepted(e.target.checked)}
+          />
+          <span>
+            I, {legalName || "[your name]"}, have read this Issuer Agreement and agree to be
+            bound by its covenants to each purchaser of {coin.ticker}.
+          </span>
+        </label>
+        <button
+          className={`btn-primary btn-large ${!canSign ? "btn-disabled" : ""}`}
+          onClick={signAndMint}
+          disabled={!canSign}
+        >
+          {busy ? "Signing & minting…" : `Sign & Mint ${coin.ticker}`}
+        </button>
+      </div>
+    );
+  }
+
+  if (step === "meme") {
+    return (
+      <div className="issuance-flow">
+        <button className="link-btn back-link" onClick={() => setStep("choice")}>
+          ← Back to issuance options
+        </button>
+        <h2 className="section-title">Meme Coin — No Agreement</h2>
+        <div className="meme-disclaimer">
+          <p>
+            <strong>{coin.name} ({coin.ticker})</strong> will be minted as a meme coin.
+          </p>
+          <p>This means:</p>
+          <ul>
+            <li>No issuer agreement and no covenant with purchasers.</li>
+            <li>No representations about identity, accuracy, or value.</li>
+            <li>No commitment to share revenue, royalties, or appreciation.</li>
+            <li>Purchasers buy it for fun — nothing is promised.</li>
+          </ul>
+          <p className="field-hint">
+            This is permanent. A meme coin cannot later gain an issuer agreement.
+          </p>
+        </div>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={memeConfirmed}
+            onChange={(e) => setMemeConfirmed(e.target.checked)}
+          />
+          <span>
+            I understand {coin.ticker} is a meme coin with no agreement, no representations,
+            and no obligations to purchasers.
+          </span>
+        </label>
+        <button
+          className={`btn-primary btn-large ${!memeConfirmed || busy ? "btn-disabled" : ""}`}
+          onClick={mintMeme}
+          disabled={!memeConfirmed || busy}
+        >
+          {busy ? "Minting…" : `Mint ${coin.ticker} as Meme Coin`}
+        </button>
+      </div>
+    );
+  }
+
+  if (step === "minting") {
+    return (
+      <div className="issuance-flow issuance-status">
+        <h2 className="section-title">Minting {coin.ticker}…</h2>
+        <p className="section-sub">Writing your coin to Solana devnet. This takes a few seconds.</p>
+        <div className="provisioning-steps">
+          <div className="provisioning-step provisioning-step-active">
+            <span className="provisioning-step-dot" />
+            <span className="provisioning-step-label">Submitting to Solana devnet…</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (step === "done" && mintResult) {
+    return (
+      <div className="issuance-flow issuance-status">
+        <span className="issuance-success-icon"><Icon name="check" size={28} /></span>
+        <h2 className="section-title">{mintResult.name} is live!</h2>
+        <p className="section-sub">
+          {mintResult.isMeme
+            ? "Minted as a meme coin — no agreement attached."
+            : "Issuer Agreement signed and recorded."}
+        </p>
+        <div className="mint-details">
+          <div className="mint-detail-row">
+            <span className="stat-label">Mint address</span>
+            <span className="stat-value mono">{mintResult.mintAddress}</span>
+          </div>
+          <div className="mint-detail-row">
+            <span className="stat-label">Transaction</span>
+            <span className="stat-value mono">{mintResult.txSignature.slice(0, 20)}…</span>
+          </div>
+          <div className="mint-detail-row">
+            <span className="stat-label">Supply</span>
+            <span className="stat-value">1,000,000 {mintResult.ticker}</span>
+          </div>
+        </div>
+        <a
+          className="btn-secondary"
+          href={`https://explorer.solana.com/address/${mintResult.mintAddress}?cluster=devnet`}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          View on Solana Explorer
+        </a>
+      </div>
+    );
+  }
+
+  return (
+    <div className="issuance-flow issuance-status">
+      <h2 className="section-title">Something went wrong</h2>
+      <p className="section-sub">{error || "The issuance request failed."}</p>
+      <button className="btn-secondary" onClick={() => { setError(null); setStep("choice"); }}>
+        Try again
+      </button>
+      <button className="link-btn back-link" onClick={onBack}>
+        ← Back to coin details
+      </button>
+    </div>
+  );
+}
+
 function ProvisioningModal({ steps, activeIndex, chainId, name }) {
   const isFinalStep = activeIndex === steps.length - 1;
   return (
@@ -4669,6 +4847,79 @@ function GlobalStyles() {
         box-shadow: 0 20px 60px rgba(14,165,233,0.28);
         animation: modalPop 0.3s ease;
       }
+
+      /* ---------------- Real issuance flow (agreement vs meme) ---------------- */
+      .issuance-flow { max-width: 640px; margin: 0 auto; padding: 8px 4px 32px; }
+      .issuance-choice-grid {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 20px;
+      }
+      @media (max-width: 560px) { .issuance-choice-grid { grid-template-columns: 1fr; } }
+      .issuance-choice-card {
+        display: flex; flex-direction: column; gap: 10px; text-align: left;
+        padding: 22px 18px; border-radius: 16px; cursor: pointer;
+        background: rgba(255,255,255,0.55); border: 2px solid rgba(14,165,233,0.25);
+        transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+        color: inherit; font: inherit;
+      }
+      .issuance-choice-card:hover:not(:disabled) {
+        transform: translateY(-2px); border-color: rgba(14,165,233,0.6);
+        box-shadow: 0 12px 32px rgba(14,165,233,0.18);
+      }
+      .issuance-choice-card:disabled { opacity: 0.6; cursor: wait; }
+      .issuance-choice-meme { border-color: rgba(168,85,247,0.3); }
+      .issuance-choice-meme:hover:not(:disabled) {
+        border-color: rgba(168,85,247,0.6); box-shadow: 0 12px 32px rgba(168,85,247,0.18);
+      }
+      .issuance-choice-icon {
+        width: 44px; height: 44px; border-radius: 12px;
+        display: flex; align-items: center; justify-content: center;
+        background: rgba(14,165,233,0.12); color: #0284c7;
+      }
+      .issuance-choice-meme .issuance-choice-icon {
+        background: rgba(168,85,247,0.12); color: #7c3aed;
+      }
+      .issuance-choice-title { font-size: 17px; font-weight: 700; }
+      .issuance-choice-desc { font-size: 13.5px; line-height: 1.55; opacity: 0.82; }
+      .issuance-choice-tag {
+        align-self: flex-start; font-size: 11.5px; font-weight: 600;
+        padding: 4px 10px; border-radius: 999px;
+        background: rgba(14,165,233,0.12); color: #0284c7;
+      }
+      .issuance-choice-meme .issuance-choice-tag {
+        background: rgba(168,85,247,0.12); color: #7c3aed;
+      }
+      .agreement-doc {
+        margin: 16px 0; border-radius: 12px; border: 1px solid rgba(14,165,233,0.2);
+        background: rgba(255,255,255,0.7); max-height: 420px; overflow-y: auto;
+      }
+      .agreement-text {
+        margin: 0; padding: 20px; font-size: 13px; line-height: 1.65;
+        white-space: pre-wrap; font-family: ui-serif, Georgia, serif; color: #1e293b;
+      }
+      .meme-disclaimer {
+        margin: 16px 0; padding: 20px; border-radius: 12px;
+        background: rgba(168,85,247,0.07); border: 1px solid rgba(168,85,247,0.25);
+        font-size: 14px; line-height: 1.6;
+      }
+      .meme-disclaimer ul { margin: 8px 0; padding-left: 20px; }
+      .meme-disclaimer li { margin: 4px 0; }
+      .issuance-status { text-align: center; padding-top: 32px; }
+      .issuance-success-icon {
+        display: inline-flex; width: 64px; height: 64px; border-radius: 50%;
+        background: rgba(34,197,94,0.14); color: #16a34a;
+        align-items: center; justify-content: center; margin-bottom: 12px;
+      }
+      .mint-details {
+        margin: 20px auto; max-width: 480px; text-align: left;
+        border-radius: 12px; border: 1px solid rgba(14,165,233,0.2);
+        background: rgba(255,255,255,0.6); padding: 4px 18px;
+      }
+      .mint-detail-row {
+        display: flex; justify-content: space-between; align-items: center; gap: 12px;
+        padding: 12px 0; border-bottom: 1px solid rgba(14,165,233,0.1);
+      }
+      .mint-detail-row:last-child { border-bottom: none; }
+      .mono { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
       .feature-lock-mark {
         width: 64px; height: 64px; margin: 0 auto 14px; border-radius: 50%;
         display: flex; align-items: center; justify-content: center;
