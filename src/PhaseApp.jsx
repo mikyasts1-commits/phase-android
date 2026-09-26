@@ -338,6 +338,26 @@ This is a condensed prototype summary for demonstration purposes and is not a bi
 // of the chain's genesis parameters (split, starting price, value thesis),
 // not a securities-style equity agreement. Optional; only shown if a
 // person wants a readable summary of what they just provisioned.
+const BUSINESS_ATTESTATION_TEXT = (businessName, ticker) => `BUSINESS ATTESTATION — PHASE SOVEREIGN CHAIN
+
+Business: ${businessName} (${ticker})
+Date: ${new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}
+
+1. Identity. I represent that I am authorized to act on behalf of the business named above and that the business name, description, and value thesis provided are accurate to the best of my knowledge.
+
+2. No Registration Documents. I acknowledge that I have not uploaded business registration, incorporation, licensing, or operating-agreement documents. This attestation stands in place of such documentation.
+
+3. Accuracy of Representations. I warrant that all statements made about this business — its nature, operations, and value proposition — are truthful and not misleading. I understand that purchasers of ${ticker} may rely on these representations.
+
+4. Authority & Compliance. I represent that this business operates lawfully in its jurisdiction and that issuing a sovereign chain for it does not violate any applicable law, regulation, or contractual obligation known to me.
+
+5. Ongoing Duty. I agree to correct any material inaccuracy in the business information promptly upon becoming aware of it.
+
+6. Isolated Ledger. I understand this chain is an isolated ledger — its trading activity and value are independent of every other chain on Phase.
+
+7. Digital Signature. My typed legal name below constitutes my digital signature on this attestation and binds me to its terms.
+
+TEMPLATE ONLY — This document is generated automatically from information provided. It is a template illustration for demonstration purposes, not a binding legal agreement and not a substitute for independent legal advice. Have legal counsel review before relying on it.`;
 function generateAgreementText({ ownerName, listingName, valueThesis, equityPublic, equityRetained, docLabel }) {
   const date = new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
   return `PHASE ISSUER AGREEMENT \u2014 TEMPLATE
@@ -1791,6 +1811,11 @@ function GoLiveTab({ onPublish }) {
   const [socialProfiles, setSocialProfiles] = useState([]); // linked social accounts: [{ platform, url, followers, engagement, verified }]
   const [showTerms, setShowTerms] = useState(false);
   const [consented, setConsented] = useState(false);
+  // Business attestation: when a business chain is provisioned without uploaded
+  // registration documents, the issuer must sign this attestation instead.
+  const [businessDocName, setBusinessDocName] = useState(null);
+  const [businessAttested, setBusinessAttested] = useState(false);
+  const [businessLegalName, setBusinessLegalName] = useState("");
   const [equityPublic, setEquityPublic] = useState(20);
   const [startingPrice, setStartingPrice] = useState(10);
   const [published, setPublished] = useState(null);
@@ -1872,12 +1897,18 @@ function GoLiveTab({ onPublish }) {
   // correctly, but it's not a hard gate.
   const hasDocumentation = true; // real agreement handled in the issuance flow
 
+  // Business chains without uploaded documents must sign the attestation.
+  const isBusinessClass = compliance && compliance.docLabel && compliance.docLabel.toLowerCase().includes("business");
+  const needsBusinessAttestation = isBusinessClass && !businessDocName;
+  const businessAttestationDone = !needsBusinessAttestation || (businessAttested && businessLegalName.trim().length >= 2);
+
   const canPublish =
     name.trim().length > 1 &&
     ticker.trim().length >= 2 &&
     tagline.trim().length > 3 &&
     consented &&
     hasDocumentation &&
+    businessAttestationDone &&
     startingPrice > 0;
 
 
@@ -2142,6 +2173,71 @@ function GoLiveTab({ onPublish }) {
             </label>
           </div>
 
+          {isBusinessClass && (
+            <div className="business-doc-block">
+              <label className="field-label">{compliance.docLabel} (optional)</label>
+              <div className="file-upload-row">
+                <label className="file-upload-btn">
+                  <input
+                    type="file"
+                    accept=".pdf,.png,.jpg,.jpeg"
+                    style={{ display: "none" }}
+                    onChange={(e) => {
+                      const f = e.target.files && e.target.files[0];
+                      setBusinessDocName(f ? f.name : null);
+                      // A fresh upload resets the attestation
+                      if (f) { setBusinessAttested(false); }
+                    }}
+                  />
+                  {businessDocName ? "Replace document" : "Upload document"}
+                </label>
+                {businessDocName && (
+                  <span className="file-upload-name">
+                    <Icon name="check" size={13} /> {businessDocName}
+                    <button className="icon-btn" onClick={() => setBusinessDocName(null)} title="Remove">
+                      <Icon name="close" size={12} />
+                    </button>
+                  </span>
+                )}
+              </div>
+              <p className="field-hint">{compliance.docHint}</p>
+            </div>
+          )}
+
+          {needsBusinessAttestation && (
+            <div className="business-attestation">
+              <h3 className="section-title" style={{ fontSize: 17 }}>Business Attestation</h3>
+              <p className="section-sub">
+                No registration documents uploaded. Sign this attestation instead — it binds
+                you to the accuracy of your business representations.
+              </p>
+              <div className="agreement-doc">
+                <pre className="agreement-text">{BUSINESS_ATTESTATION_TEXT(name.trim() || "[Business name]", ticker.trim() || "[TICKER]")}</pre>
+              </div>
+              <label className="field-label" htmlFor="business-legal-name">
+                Your full legal name
+              </label>
+              <input
+                id="business-legal-name"
+                className="text-input signature-input"
+                placeholder="Type your full legal name to sign"
+                value={businessLegalName}
+                onChange={(e) => setBusinessLegalName(e.target.value)}
+              />
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={businessAttested}
+                  onChange={(e) => setBusinessAttested(e.target.checked)}
+                />
+                <span>
+                  I, {businessLegalName || "[your name]"}, attest that the business information
+                  provided is accurate and agree to be bound by this attestation.
+                </span>
+              </label>
+            </div>
+          )}
+
         <label className="field-label" htmlFor="starting-price">
           Starting Share Price
         </label>
@@ -2200,7 +2296,8 @@ function GoLiveTab({ onPublish }) {
         </button>
         {!canPublish && (
           <p className="field-hint">
-            Add a name, ticker, value description, starting price, and agree to the terms to continue.
+            Add a name, ticker, value description, starting price, agree to the terms
+            {needsBusinessAttestation && ", and sign the business attestation"} to continue.
           </p>
         )}
 
@@ -5181,6 +5278,10 @@ function GlobalStyles() {
       .announce-card-img { width: 220px; height: 220px; border-radius: 16px; box-shadow: 0 12px 32px rgba(2,132,199,0.25); }
       .issuance-meme-alt { margin-top: 28px; }
       .issuance-meme-alt .market-entry-divider { margin: 0 0 12px; }
+      .business-doc-block { margin: 18px 0 6px; padding: 14px; border-radius: 14px; background: rgba(255,255,255,0.35); }
+      .file-upload-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; flex-wrap: wrap; }
+      .file-upload-name { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: #0284c7; }
+      .business-attestation { margin: 20px 0; padding: 18px; border-radius: 16px; border: 1.5px solid rgba(14,165,233,0.25); background: rgba(14,165,233,0.05); }
       .chain-picker { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 16px; }
       .chain-btn {
         padding: 10px 16px; border-radius: 12px; cursor: pointer;
