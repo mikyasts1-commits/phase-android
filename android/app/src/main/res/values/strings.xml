@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Phase</string>
+    <string name="title_activity_main">Phase</string>
+    <string name="package_name">com.phase.app</string>
+    <string name="custom_url_scheme">com.phase.app</string>
+</resources>
