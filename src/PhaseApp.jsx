@@ -2323,6 +2323,15 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
         equityRetained: coin.equityRetained,
       });
       setDraftId(draft.draftId);
+      // Fetch the agreement text now so the choice screen (which is now the
+      // agreement screen) can display the full legal document immediately.
+      try {
+        const ag = await issuanceApi.getAgreement(draft.draftId);
+        setAgreementText(ag.agreementText);
+        setAgreementHash(ag.agreementHash);
+      } catch {
+        // agreement text load failure surfaces at sign time
+      }
       return draft.draftId;
     } catch (e) {
       setError(e.message);
@@ -2396,18 +2405,7 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
 
   const continueFromSocial = async () => {
     if (chosenPath === "agreement") {
-      setBusy(true);
-      try {
-        const ag = await issuanceApi.getAgreement(draftId);
-        setAgreementText(ag.agreementText);
-        setAgreementHash(ag.agreementHash);
-        setStep("agreement");
-      } catch (e) {
-        setError(e.message);
-        setStep("error");
-      } finally {
-        setBusy(false);
-      }
+      setStep("choice");
     } else {
       setStep("meme");
     }
@@ -2457,42 +2455,65 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
   };
 
   if (step === "choice") {
+    const canSign = legalName.trim().length >= 2 && accepted && !busy;
     return (
       <div className="issuance-flow">
         <button className="link-btn back-link" onClick={onBack}>
           ← Back to coin details
         </button>
-        <h2 className="section-title">How do you want to issue {coin.name}?</h2>
+        <h2 className="section-title">Issuer Agreement</h2>
         <p className="section-sub">
           {coin.ticker} · {coin.equityPublic}% public / {coin.equityRetained}% retained · 1,000,000 shares on Solana devnet
         </p>
-        <div className="issuance-choice-grid">
+        <p className="section-sub">
+          This covenant is made for the benefit of everyone who purchases {coin.ticker}. Read it
+          carefully — your digital signature binds you to it.
+        </p>
+        <div className="agreement-doc">
+          <pre className="agreement-text">{agreementText}</pre>
+        </div>
+        {agreementHash && (
+          <p className="field-hint">Document hash: {agreementHash.slice(0, 16)}…</p>
+        )}
+        <label className="field-label" htmlFor="issuance-legal-name">
+          Your full legal name
+        </label>
+        <input
+          id="issuance-legal-name"
+          className="text-input signature-input"
+          placeholder="Type your full legal name to sign"
+          value={legalName}
+          onChange={(e) => setLegalName(e.target.value)}
+        />
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={accepted}
+            onChange={(e) => setAccepted(e.target.checked)}
+          />
+          <span>
+            I, {legalName || "[your name]"}, have read this Issuer Agreement and agree to be
+            bound by its covenants to each purchaser of {coin.ticker}.
+          </span>
+        </label>
+        <button
+          className={`btn-primary btn-large ${!canSign ? "btn-disabled" : ""}`}
+          onClick={signAndMint}
+          disabled={!canSign}
+        >
+          {busy ? "Signing & minting…" : `Sign & Mint ${coin.ticker}`}
+        </button>
+
+        <div className="issuance-meme-alt">
+          <div className="market-entry-divider">
+            <span>or</span>
+          </div>
           <button
-            className="issuance-choice-card"
-            onClick={chooseAgreement}
-            disabled={busy}
-          >
-            <span className="issuance-choice-icon"><Icon name="check" size={22} /></span>
-            <span className="issuance-choice-title">Sign the Issuer Agreement</span>
-            <span className="issuance-choice-desc">
-              Create a binding covenant with everyone who buys your coin. You represent who you
-              are, warrant your statements are accurate, and commit to sharing value with
-              purchasers. Signed digitally with your legal name.
-            </span>
-            <span className="issuance-choice-tag">Recommended for serious projects</span>
-          </button>
-          <button
-            className="issuance-choice-card issuance-choice-meme"
+            className="btn btn-ghost btn-full"
             onClick={chooseMeme}
             disabled={busy}
           >
-            <span className="issuance-choice-icon"><Icon name="soft" size={22} /></span>
-            <span className="issuance-choice-title">Mint as a Meme Coin</span>
-            <span className="issuance-choice-desc">
-              No agreement, no representations, no promises. Just a fun coin with no covenant
-              attached — purchasers get exactly what's on the tin: a meme.
-            </span>
-            <span className="issuance-choice-tag">No strings attached</span>
+            Mint as a Meme Coin — no agreement, no obligations
           </button>
         </div>
         {busy && <p className="field-hint">Preparing your coin draft…</p>}
@@ -2563,55 +2584,6 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
     );
   }
 
-  if (step === "agreement") {
-    const canSign = legalName.trim().length >= 2 && accepted && !busy;
-    return (
-      <div className="issuance-flow">
-        <button className="link-btn back-link" onClick={() => setStep("choice")}>
-          ← Back to issuance options
-        </button>
-        <h2 className="section-title">Issuer Agreement</h2>
-        <p className="section-sub">
-          This covenant is made for the benefit of everyone who purchases {coin.ticker}. Read it
-          carefully — your digital signature binds you to it.
-        </p>
-        <div className="agreement-doc">
-          <pre className="agreement-text">{agreementText}</pre>
-        </div>
-        {agreementHash && (
-          <p className="field-hint">Document hash: {agreementHash.slice(0, 16)}…</p>
-        )}
-        <label className="field-label" htmlFor="issuance-legal-name">
-          Your full legal name
-        </label>
-        <input
-          id="issuance-legal-name"
-          className="text-input signature-input"
-          placeholder="Type your full legal name to sign"
-          value={legalName}
-          onChange={(e) => setLegalName(e.target.value)}
-        />
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={accepted}
-            onChange={(e) => setAccepted(e.target.checked)}
-          />
-          <span>
-            I, {legalName || "[your name]"}, have read this Issuer Agreement and agree to be
-            bound by its covenants to each purchaser of {coin.ticker}.
-          </span>
-        </label>
-        <button
-          className={`btn-primary btn-large ${!canSign ? "btn-disabled" : ""}`}
-          onClick={signAndMint}
-          disabled={!canSign}
-        >
-          {busy ? "Signing & minting…" : `Sign & Mint ${coin.ticker}`}
-        </button>
-      </div>
-    );
-  }
 
   if (step === "meme") {
     return (
@@ -5207,6 +5179,8 @@ function GlobalStyles() {
       .announce-title { font-size: 16px; font-weight: 700; margin: 0; }
       .announce-result { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; align-items: center; }
       .announce-card-img { width: 220px; height: 220px; border-radius: 16px; box-shadow: 0 12px 32px rgba(2,132,199,0.25); }
+      .issuance-meme-alt { margin-top: 28px; }
+      .issuance-meme-alt .market-entry-divider { margin: 0 0 12px; }
       .chain-picker { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 16px; }
       .chain-btn {
         padding: 10px 16px; border-radius: 12px; cursor: pointer;
