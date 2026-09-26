@@ -15,7 +15,7 @@ export const MARKETPLACE_LOCKED = true;
 // (USDC and USDT) are wired up. Funding is crypto-only: fiat methods
 // (card, Interac, wire, ACH, Cash App) have been removed entirely.
 // Set to false to enable the crypto funding flow.
-export const CRYPTO_FUNDING_LOCKED = true;
+export const CRYPTO_FUNDING_LOCKED = false;
 
 // GO_LIVE_LOCKED: when true, the Go Live tab renders its content blurred
 // behind a lock card instead of the operable coin-issuance form, until the
