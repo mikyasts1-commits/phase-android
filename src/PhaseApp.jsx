@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { checkForUpdates, dismissUpdate, UpdateDialog } from "./update-check.jsx";
 import { MARKETPLACE_LOCKED, CRYPTO_FUNDING_LOCKED, GO_LIVE_LOCKED, DASHBOARD_LOCKED } from "./feature-flags.js";
+import { generateWallet, restoreWallet, createSovereignChain } from "./sovereign-client.js";
 
 /* ------------------------- Phase backend API client ------------------------- */
 // Real backend: issuance (draft → agreement → sign → mint) and funding.
@@ -1307,6 +1308,27 @@ export default function App() {
   const [chatOpen, setChatOpen] = useState(false);
   const [toast, setToast] = useState(null);
   const [liveFx, setLiveFx] = useState(BASE_FX);
+  // Sovereign wallet: Ed25519 keypair for signing ledger transactions.
+  // Generated on first launch, persisted as JWK in localStorage.
+  const [sovereignWallet, setSovereignWallet] = useState(null);
+  useEffect(() => {
+    (async () => {
+      try {
+        const stored = localStorage.getItem("phase_sovereign_wallet");
+        if (stored) {
+          const { jwk, pubkeyHex } = JSON.parse(stored);
+          const w = await restoreWallet(jwk, pubkeyHex);
+          setSovereignWallet(w);
+        } else {
+          const w = await generateWallet();
+          localStorage.setItem("phase_sovereign_wallet", JSON.stringify({ jwk: w.jwk, pubkeyHex: w.pubkeyHex }));
+          setSovereignWallet(w);
+        }
+      } catch (e) {
+        console.warn("sovereign wallet init failed", e);
+      }
+    })();
+  }, []);
 
   const showToast = useCallback((msg) => {
     setToast(msg);
@@ -1448,13 +1470,39 @@ export default function App() {
     showToast("1,000 PHASE Coins added to your wallet");
   };
 
-  const publishAsset = (form) => {
+  const publishAsset = async (form) => {
     const initialPrice = Math.max(0.01, parseFloat(form.startingPrice) || 10);
     const letters = form.name.replace(/[^a-zA-Z]/g, "").toUpperCase().slice(0, 5);
     const generatedTicker = form.tickerOverride || "p" + (letters || "PHASE");
-    const chainId = form.chainIdOverride || generateChainId();
-    const publicShares = Math.round(SOVEREIGN_TOTAL_SHARES * ((form.equityPublic || 0) / 100));
-    const retainedShares = SOVEREIGN_TOTAL_SHARES - publicShares;
+    const totalShares = Math.max(1000, parseInt(form.totalShares) || SOVEREIGN_TOTAL_SHARES);
+    const publicShares = Math.round(totalShares * ((form.equityPublic || 0) / 100));
+    const retainedShares = totalShares - publicShares;
+
+    // Create a real sovereign chain on the backend (Phase 1 MVP).
+    // Falls back to local-only mode if the backend is unreachable.
+    let sovereignChainId = form.chainIdOverride || generateChainId();
+    let sovereignLive = false;
+    if (sovereignWallet) {
+      try {
+        showToast("Creating your sovereign chain...");
+        const res = await createSovereignChain({
+          coinName: form.name,
+          ticker: generatedTicker,
+          totalSupply: String(totalShares),
+          decimals: 6,
+          issuerAddress: sovereignWallet.address,
+          allowMint: true,
+        });
+        if (res.status === 201 && res.json.chain_id) {
+          sovereignChainId = res.json.chain_id;
+          sovereignLive = true;
+        } else {
+          console.warn("sovereign chain creation failed, using local mode", res.json);
+        }
+      } catch (e) {
+        console.warn("sovereign chain creation error, using local mode", e);
+      }
+    }
     const newAsset = {
       id: uid(),
       name: form.name,
@@ -1488,16 +1536,22 @@ export default function App() {
       // dedicated chain rather than minting onto a shared network. This
       // sandboxes each person/asset's trading activity so no chain's
       // volatility or liquidity can drag on any other chain's price.
-      chainId,
+      chainId: sovereignChainId,
+      sovereignLive, // true if a real backend chain was provisioned
       zeroBaseFee: true,
-      totalMinted: SOVEREIGN_TOTAL_SHARES,
+      totalMinted: totalShares,
       publicFloatShares: publicShares,
       retainedShares,
       chainHistory: [genesisBlock(form.name, generatedTicker)],
       phaseCoinPool: 0, // grows via the periodic PHASE inflow engine while the chain is live
     };
     setAssets((prev) => [newAsset, ...prev]);
-    showToast(`${form.name} is live — chain ${chainId} provisioned`);
+    showToast(
+      sovereignLive
+        ? `${form.name} is live on its sovereign chain`
+        : `${form.name} is live (local mode — backend unreachable)`
+    );
+    setHasIssuedCoin(true);
     setActiveTab("market");
     return newAsset;
   };
@@ -1981,10 +2035,10 @@ function GoLiveTab({ onPublish }) {
           equityRetained,
         }}
         onBack={() => setFlowStep("form")}
-        onComplete={(mintedCoin, isMeme) => {
+        onComplete={async (mintedCoin, isMeme) => {
           // Hand the real minted coin to the parent for dashboard unlock.
           setHasIssuedCoin(true);
-          const asset = onPublish({
+          const asset = await onPublish({
             name: mintedCoin.name,
             category,
             subsection,
@@ -3054,9 +3108,9 @@ function BringYourOwnNetworkFlow({ onBack, onPublish }) {
 
   const canSubmit = network && productName.trim().length > 1 && identifier.trim().length > 1;
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!canSubmit) return;
-    const asset = onPublish({
+    const asset = await onPublish({
       name: productName,
       category,
       subsection: ASSET_CATEGORIES[category].subsections[0],

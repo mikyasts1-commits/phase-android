@@ -8,7 +8,7 @@
 // blurred behind a "Marketplace opening soon" lock overlay, until the crypto
 // funding rails (USDC and USDT deposits) are finished and trading goes live.
 // Set to false to restore the normal marketplace with no overlay or blur.
-export const MARKETPLACE_LOCKED = true;
+export const MARKETPLACE_LOCKED = false;
 
 // CRYPTO_FUNDING_LOCKED: when true, the Fund Account modal renders its content
 // blurred behind a "coming soon" lock card until the crypto deposit rails
