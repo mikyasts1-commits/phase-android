@@ -3422,7 +3422,8 @@ function CardFundPanel({ onFunded }) {
 
 function FundAccountModal({ onClose, onFund }) {
   const [method, setMethod] = useState("card"); // card | crypto
-  const [step, setStep] = useState("loading"); // loading | deposit | waiting | confirmed | error
+  const [step, setStep] = useState("deposit"); // deposit | waiting | confirmed (crypto flow)
+  const [cryptoLoading, setCryptoLoading] = useState(false); // crypto tab loads lazily
   const [depositInfo, setDepositInfo] = useState(null);
   const [balances, setBalances] = useState(null);
   const [chain, setChain] = useState("BASE-SEPOLIA");
@@ -3443,12 +3444,20 @@ function FundAccountModal({ onClose, onFund }) {
   const isBtcChain = chain === "BTC-TESTNET";
 
   useEffect(() => {
-    loadDepositInfo();
     return () => {
       mountedRef.current = false;
       if (pollRef.current) clearInterval(pollRef.current);
     };
   }, []);
+
+  // Lazy-load crypto deposit info only when the Crypto tab is opened.
+  // The Card tab never depends on it, so a crypto backend hiccup can't
+  // block card payments.
+  useEffect(() => {
+    if (method === "crypto" && !depositInfo && !cryptoLoading) {
+      loadDepositInfo();
+    }
+  }, [method]);
 
   useEffect(() => {
     const c = CHAINS.find((x) => x.id === chain);
@@ -3456,7 +3465,7 @@ function FundAccountModal({ onClose, onFund }) {
   }, [chain]);
 
   const loadDepositInfo = async () => {
-    setStep("loading");
+    setCryptoLoading(true);
     setError(null);
     try {
       if (isBtcChain) {
@@ -3478,17 +3487,17 @@ function FundAccountModal({ onClose, onFund }) {
         const firstChain = dep.defaultChain || Object.keys(dep.addresses || {})[0];
         if (firstChain) setChain(firstChain);
       }
-      setStep("deposit");
+      if (mountedRef.current) setCryptoLoading(false);
     } catch (e) {
       if (!mountedRef.current) return;
       setError(e.message);
-      setStep("error");
+      setCryptoLoading(false);
     }
   };
 
-  // Reload when switching between BTC and Circle chains
+  // Reload when switching between BTC and Circle chains (crypto tab only)
   useEffect(() => {
-    if (step === "deposit") loadDepositInfo();
+    if (method === "crypto" && depositInfo) loadDepositInfo();
   }, [chain]);
 
   const copyAddress = async () => {
@@ -3565,23 +3574,7 @@ function FundAccountModal({ onClose, onFund }) {
           <Icon name="close" size={18} />
         </button>
 
-        {step === "loading" && (
-          <div className="funding-processing">
-            <span className="spinner spinner-large" />
-            <h3>Setting up your deposit…</h3>
-            <p className="section-sub">Generating your wallet addresses.</p>
-          </div>
-        )}
-
-        {step === "error" && (
-          <div className="funding-processing">
-            <h3>Couldn&apos;t load deposit info</h3>
-            <p className="section-sub">{error || "The funding backend didn&apos;t respond."}</p>
-            <button className="btn btn-secondary" onClick={loadDepositInfo}>Try again</button>
-          </div>
-        )}
-
-        {step === "deposit" && depositInfo && (
+        {step === "deposit" && (
           <>
             <h3>Fund Your Account</h3>
 
@@ -3602,6 +3595,23 @@ function FundAccountModal({ onClose, onFund }) {
 
             {method === "card" ? (
               <CardFundPanel onFunded={onFund} />
+            ) : cryptoLoading ? (
+              <div className="funding-processing">
+                <span className="spinner spinner-large" />
+                <h3>Setting up your deposit…</h3>
+                <p className="section-sub">Generating your wallet addresses.</p>
+              </div>
+            ) : error ? (
+              <div className="funding-processing">
+                <h3>Couldn&apos;t load deposit info</h3>
+                <p className="section-sub">{error || "The funding backend didn't respond."}</p>
+                <button className="btn btn-secondary" onClick={loadDepositInfo}>Try again</button>
+              </div>
+            ) : !depositInfo ? (
+              <div className="funding-processing">
+                <span className="spinner spinner-large" />
+                <h3>Setting up your deposit…</h3>
+              </div>
             ) : (
             <>
             <p className="section-sub">
