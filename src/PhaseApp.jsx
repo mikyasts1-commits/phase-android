@@ -1892,7 +1892,7 @@ function ConfettiBurst() {
 /* =============================== GO LIVE TAB ================================ */
 
 function GoLiveTab({ onPublish }) {
-  const [flowStep, setFlowStep] = useState("entry"); // entry | bringYourOwn | form | issuance
+  const [flowStep, setFlowStep] = useState("entry"); // entry | describe | bringYourOwn | form | issuance
   const [selectedPath, setSelectedPath] = useState(null); // 'capital' | 'business' | 'asset'
   const [selectedExample, setSelectedExample] = useState(null); // example object from GOLIVE_PATHS, or null for "describe my own"
   const [usingOwnThesis, setUsingOwnThesis] = useState(false);
@@ -1928,6 +1928,7 @@ function GoLiveTab({ onPublish }) {
 
   const choosePath = (pathKey) => {
     setSelectedPath(pathKey);
+    setFlowStep("describe");
   };
 
   const chooseExample = (example) => {
@@ -2018,11 +2019,19 @@ function GoLiveTab({ onPublish }) {
   if (flowStep === "entry") {
     return (
       <GoLivePathPicker
-        selectedPath={selectedPath}
         choosePath={choosePath}
+        onBringYourOwn={() => setFlowStep("bringYourOwn")}
+      />
+    );
+  }
+
+  if (flowStep === "describe") {
+    return (
+      <GoLiveDescribeStep
+        pathKey={selectedPath}
         chooseExample={chooseExample}
         chooseOwnThesis={chooseOwnThesis}
-        onBringYourOwn={() => setFlowStep("bringYourOwn")}
+        onBack={() => setFlowStep("entry")}
       />
     );
   }
@@ -2085,8 +2094,8 @@ function GoLiveTab({ onPublish }) {
   return (
     <div className="golive-grid">
       <section className="glass-card golive-form">
-        <button className="link-btn back-link" onClick={() => setFlowStep("entry")}>
-          ← Back to chain type
+        <button className="link-btn back-link" onClick={() => setFlowStep("describe")}>
+          ← Back
         </button>
         <h2 className="section-title">Issue Your Sovereign Chain</h2>
         <p className="section-sub">
@@ -3046,7 +3055,7 @@ function GeneratedAgreementModal({ text, onClose }) {
   );
 }
 
-function GoLivePathPicker({ selectedPath, choosePath, chooseExample, chooseOwnThesis, onBringYourOwn }) {
+function GoLivePathPicker({ choosePath, onBringYourOwn }) {
   return (
     <div className="golive-entry-wrap">
       <div className="glass-card golive-entry-card">
@@ -3059,40 +3068,20 @@ function GoLivePathPicker({ selectedPath, choosePath, chooseExample, chooseOwnTh
           {Object.entries(GOLIVE_PATHS).map(([key, path]) => (
             <button
               key={key}
-              className={`golive-path-btn ${selectedPath === key ? "golive-path-btn-active" : ""}`}
+              className="golive-path-btn"
               onClick={() => choosePath(key)}
             >
-              {selectedPath === key && (
-                <span className="golive-path-check">
-                  <Icon name="check" size={14} />
-                </span>
-              )}
               <span className="golive-path-icon">
                 <Icon name={path.icon} size={22} />
               </span>
               <span className="golive-path-label">{path.label}</span>
               <span className="golive-path-sublabel">{path.sublabel}</span>
+              <span className="golive-path-arrow">
+                <Icon name="arrowRight" size={16} />
+              </span>
             </button>
           ))}
         </div>
-
-        {selectedPath && (
-          <div className="golive-examples-block">
-            <label className="field-label">Choose what best describes it</label>
-            <div className="golive-examples-list">
-              {GOLIVE_PATHS[selectedPath].examples.map((ex) => (
-                <button key={ex.label} className="golive-example-btn" onClick={() => chooseExample(ex)}>
-                  <span>{ex.label}</span>
-                  <Icon name="arrowRight" size={14} />
-                </button>
-              ))}
-              <button className="golive-example-btn golive-example-btn-own" onClick={chooseOwnThesis}>
-                <span>None of these — let me describe my own value thesis</span>
-                <Icon name="arrowRight" size={14} />
-              </button>
-            </div>
-          </div>
-        )}
       </div>
 
       <button className="glass-card golive-byon-card" onClick={onBringYourOwn}>
@@ -3107,6 +3096,42 @@ function GoLivePathPicker({ selectedPath, choosePath, chooseExample, chooseOwnTh
         </div>
         <Icon name="arrowRight" size={16} />
       </button>
+    </div>
+  );
+}
+
+function GoLiveDescribeStep({ pathKey, chooseExample, chooseOwnThesis, onBack }) {
+  const path = pathKey ? GOLIVE_PATHS[pathKey] : null;
+  if (!path) {
+    return (
+      <div className="golive-entry-wrap">
+        <button className="link-btn back-link" onClick={onBack}>← Back</button>
+      </div>
+    );
+  }
+  return (
+    <div className="golive-entry-wrap">
+      <div className="glass-card golive-entry-card">
+        <button className="link-btn back-link" onClick={onBack}>
+          ← Back
+        </button>
+        <h2 className="section-title">{path.label}</h2>
+        <p className="section-sub">{path.sublabel}</p>
+
+        <label className="field-label">Choose what best describes it</label>
+        <div className="golive-examples-list">
+          {path.examples.map((ex) => (
+            <button key={ex.label} className="golive-example-btn" onClick={() => chooseExample(ex)}>
+              <span>{ex.label}</span>
+              <Icon name="arrowRight" size={14} />
+            </button>
+          ))}
+          <button className="golive-example-btn golive-example-btn-own" onClick={chooseOwnThesis}>
+            <span>None of these — let me describe my own value thesis</span>
+            <Icon name="arrowRight" size={14} />
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -5282,6 +5307,10 @@ function GlobalStyles() {
       .golive-path-label { font-weight: 700; font-size: 14.5px; }
       .golive-path-sublabel { font-size: 12px; opacity: 0.7; line-height: 1.4; }
       .golive-path-btn-active .golive-path-sublabel { opacity: 0.9; }
+      .golive-path-arrow {
+        position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+        color: var(--sky-500); opacity: 0.6; display: flex; align-items: center;
+      }
 
       .golive-examples-block { margin-top: 22px; padding-top: 18px; border-top: 1px dashed rgba(14,165,233,0.2); }
       .golive-examples-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
