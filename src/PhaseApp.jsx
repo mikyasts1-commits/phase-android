@@ -41,8 +41,22 @@ const issuanceApi = {
     }),
 };
 
-const socialApi = {
-  getProviders: () => backendFetch("/social/providers"),
+// Marketplace settlement: real two-legged trades for sovereign coins.
+// POST /trades/buy moves buyer USD -> issuer USD and float -> buyer on-chain.
+const tradeApi = {
+  buy: (chainId, { amountUsd, buyerAddress, idempotencyKey } = {}) =>
+    backendFetch("/trades/buy", {
+      method: "POST",
+      body: { userId: "app-user", chainId, amountUsd, buyerAddress },
+      idempotencyKey: idempotencyKey || `buy-${chainId}-${Date.now()}`,
+    }),
+  balances: () => backendFetch(`/trades/balances?userId=app-user`),
+  history: (role = "seller") => backendFetch(`/trades/history?userId=app-user&role=${role}`),
+  topup: (amountUsd) =>
+    backendFetch("/trades/topup", { method: "POST", body: { userId: "app-user", amountUsd } }),
+};
+
+const socialApi = {  getProviders: () => backendFetch("/social/providers"),
   getAuthorizeUrl: (provider, userId) =>
     backendFetch(`/social/${provider}/authorize?userId=${encodeURIComponent(userId)}`),
   getConnections: (userId) =>
@@ -1315,6 +1329,23 @@ export default function App() {
   const [holdings, setHoldings] = useState([]); // { assetId, units, costBasisUsd }
   const [txHistory, setTxHistory] = useState([]);
   const [cashBalances, setCashBalances] = useState({}); // { usd: 0, cad: 0, usdc: 0, ... } funded cash, separate from PHASE coins
+  // Backend settlement ledger (USD) for sovereign-coin trades. Buyer USD is
+  // debited here and issuer USD credited here on every buy — this is the
+  // "issuer gets paid" account. Test rails only for now.
+  const [tradeCashUsd, setTradeCashUsd] = useState(0);
+  const [coinSalesUsd, setCoinSalesUsd] = useState(0); // lifetime earnings as a seller/issuer
+  const refreshTradeBalances = useCallback(async () => {
+    try {
+      const data = await tradeApi.balances();
+      setTradeCashUsd(Number(data?.balances?.USD) || 0);
+      setCoinSalesUsd(Number(data?.lifetimeSalesUsd) || 0);
+    } catch (e) {
+      console.warn("trade balances refresh failed", e);
+    }
+  }, []);
+  useEffect(() => {
+    refreshTradeBalances();
+  }, [refreshTradeBalances]);
   const [cryptoFunded, setCryptoFunded] = useState(false); // true once real testnet balances are detected
   const [hasIssuedCoin, setHasIssuedCoin] = useState(false); // true once the user mints their own coin
   const [netWorthHistory, setNetWorthHistory] = useState([]); // [{ t, valueUsd }] for the dashboard trend line
@@ -1569,8 +1600,60 @@ export default function App() {
     return newAsset;
   };
 
-  const invest = (asset, amountUsd, payCurrencyId) => {
+  const invest = async (asset, amountUsd, payCurrencyId) => {
     if (amountUsd <= 0) return;
+
+    // Sovereign coins settle for real on the backend: buyer USD -> issuer USD
+    // plus public float -> buyer on the coin's own chain. This is what pays
+    // the issuer when someone buys their coin.
+    const isSovereign = asset.chainId && String(asset.chainId).startsWith("ch_");
+    if (isSovereign) {
+      if (!sovereignWallet?.address) {
+        showToast("Your Phase wallet isn't ready yet — try again in a moment");
+        return;
+      }
+      try {
+        const res = await tradeApi.buy(asset.chainId, {
+          amountUsd,
+          buyerAddress: sovereignWallet.address,
+        });
+        const units = Number(res.trade.units) || 0;
+        const paidUsd = Number(res.trade.amountUsd) || 0;
+        setHoldings((prev) => {
+          const existing = prev.find((h) => h.assetId === asset.id);
+          if (existing) {
+            return prev.map((h) =>
+              h.assetId === asset.id
+                ? { ...h, units: h.units + units, costBasisUsd: h.costBasisUsd + paidUsd }
+                : h
+            );
+          }
+          return [...prev, { assetId: asset.id, units, costBasisUsd: paidUsd }];
+        });
+        setTxHistory((prev) => [
+          {
+            id: uid(),
+            assetName: asset.name,
+            amountUsd: paidUsd,
+            currency: "usd",
+            time: new Date(),
+            type: "invest",
+            txId: res.trade.txId,
+          },
+          ...prev,
+        ]);
+        await refreshTradeBalances();
+        showToast(`Bought ${units} ${asset.ticker} — $${paidUsd.toFixed(2)} sent to the issuer`);
+      } catch (e) {
+        if (e.code === "insufficient_funds" || e.status === 402) {
+          showToast("Not enough trade USD — add test funds and try again");
+        } else {
+          showToast(e.message || "Trade failed — please try again");
+        }
+      }
+      return;
+    }
+
     const units = amountUsd / asset.price;
 
     if (payCurrencyId === "phase") {
@@ -1694,6 +1777,11 @@ export default function App() {
             phaseCoins={phaseCoins}
             cashBalances={cashBalances}
             liveFx={liveFx}
+            tradeCashUsd={tradeCashUsd}
+            onTopup={async (amt) => {
+              await tradeApi.topup(amt);
+              await refreshTradeBalances();
+            }}
           />
         )}
         {activeTab === "dashboard" && (
@@ -1713,6 +1801,8 @@ export default function App() {
               setCurrency={setCurrency}
               phaseCoins={phaseCoins}
               cashBalances={cashBalances}
+              tradeCashUsd={tradeCashUsd}
+              coinSalesUsd={coinSalesUsd}
               onFund={fundAccount}
               txHistory={txHistory}
               onExplore={() => setActiveTab("market")}
@@ -2056,6 +2146,7 @@ function GoLiveTab({ onPublish, issuerAddress }) {
           equityPublic,
           equityRetained,
           totalShares,
+          startingPrice,
         }}
         issuerAddress={issuerAddress}
         onBack={() => setFlowStep("form")}
@@ -2568,6 +2659,7 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
         valueThesis: coin.tagline,
         equityPublic: coin.equityPublic,
         equityRetained: coin.equityRetained,
+        priceUsd: coin.startingPrice,
       });
       setDraftId(draft.draftId);
       // Fetch the agreement text now so the choice screen (which is now the
@@ -3859,7 +3951,7 @@ function CategoryPicker({ counts, onPick }) {
   );
 }
 
-function MarketplaceTab({ assets, currency, setCurrency, onInvest, phaseCoins, cashBalances, liveFx }) {
+function MarketplaceTab({ assets, currency, setCurrency, onInvest, phaseCoins, cashBalances, liveFx, tradeCashUsd, onTopup }) {
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [marketEntry, setMarketEntry] = useState("select"); // select (dropdown) | browse (all category cards)
   const [subsectionFilter, setSubsectionFilter] = useState("all");
@@ -4000,6 +4092,8 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, phaseCoins, c
           phaseCoins={phaseCoins}
           cashBalances={cashBalances}
           liveFx={liveFx}
+          tradeCashUsd={tradeCashUsd}
+          onTopup={onTopup}
           onClose={() => setActiveAsset(null)}
           onInvest={(amount, payCurrency) => {
             onInvest(activeAsset, amount, payCurrency);
@@ -4471,14 +4565,28 @@ function FinancialsModal({ asset, currency, liveFx, onClose, onInvest }) {
   );
 }
 
-function InvestModal({ asset, phaseCoins, cashBalances, liveFx, onClose, onInvest }) {
+function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, onTopup, onClose, onInvest }) {
   const [amount, setAmount] = useState("");
   const [usePhase, setUsePhase] = useState(true);
   const [payCurrency, setPayCurrency] = useState("usd");
+  const [toppingUp, setToppingUp] = useState(false);
 
-  const effectivePayId = usePhase ? "phase" : payCurrency;
+  // Sovereign coins settle for real: buyer USD -> issuer USD on the backend,
+  // plus coins move on the coin's own chain. Only Trade USD is accepted.
+  const isSovereign = asset.chainId && String(asset.chainId).startsWith("ch_");
+
+  const effectivePayId = isSovereign ? "trade-usd" : usePhase ? "phase" : payCurrency;
   const numericAmount = parseFloat(amount) || 0;
-  const availableInPayCurrency = cashBalances[payCurrency] || 0;
+  const availableInPayCurrency = isSovereign ? tradeCashUsd || 0 : cashBalances[payCurrency] || 0;
+
+  const handleTopup = async () => {
+    setToppingUp(true);
+    try {
+      await onTopup(1000);
+    } finally {
+      setToppingUp(false);
+    }
+  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -4495,6 +4603,25 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, onClose, onInves
         </div>
 
         <label className="field-label">Pay with</label>
+        {isSovereign ? (
+          <>
+            <p className="field-hint">
+              Trade USD balance: <strong>${(tradeCashUsd || 0).toFixed(2)}</strong>
+              {" — "}your payment goes straight to the coin issuer.
+            </p>
+            {(tradeCashUsd || 0) < (parseFloat(amount) || 0) && (
+              <button
+                className="pill-btn"
+                style={{ marginTop: 6 }}
+                disabled={toppingUp}
+                onClick={handleTopup}
+              >
+                {toppingUp ? "Adding…" : "Add $1,000 test funds"}
+              </button>
+            )}
+          </>
+        ) : (
+        <>
         <div className="platform-pills">
           <button
             className={`pill-btn ${usePhase ? "pill-btn-active" : ""}`}
@@ -4523,8 +4650,10 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, onClose, onInves
             </p>
           </>
         )}
+        </>
+        )}
 
-        <label className="field-label">Amount {!usePhase && `(in ${payCurrency.toUpperCase()})`}</label>
+        <label className="field-label">Amount {isSovereign ? "(in USD)" : !usePhase && `(in ${payCurrency.toUpperCase()})`}</label>
         <input
           className="text-input"
           type="number"
@@ -4536,11 +4665,13 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, onClose, onInves
         {numericAmount > 0 && (
           <p className="field-hint">
             You'll receive approximately{" "}
-            {(
-              (usePhase ? numericAmount / (liveFx.phase || BASE_FX.phase) : numericAmount / (liveFx[payCurrency] || 1)) /
-              asset.price
-            ).toFixed(4)}{" "}
-            shares.
+            {isSovereign
+              ? `${Math.floor(numericAmount / asset.price)}`
+              : (
+                  (usePhase ? numericAmount / (liveFx.phase || BASE_FX.phase) : numericAmount / (liveFx[payCurrency] || 1)) /
+                  asset.price
+                ).toFixed(4)}{" "}
+            {isSovereign ? "coins" : "shares"}.
           </p>
         )}
 
@@ -4548,9 +4679,11 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, onClose, onInves
           className={`btn-primary btn-large btn-full ${numericAmount <= 0 ? "btn-disabled" : ""}`}
           disabled={numericAmount <= 0}
           onClick={() => {
-            const amountUsd = usePhase
-              ? numericAmount / (liveFx.phase || BASE_FX.phase)
-              : numericAmount / (liveFx[payCurrency] || 1);
+            const amountUsd = isSovereign
+              ? numericAmount
+              : usePhase
+                ? numericAmount / (liveFx.phase || BASE_FX.phase)
+                : numericAmount / (liveFx[payCurrency] || 1);
             onInvest(amountUsd, effectivePayId);
           }}
         >
@@ -4570,6 +4703,8 @@ function DashboardTab({
   setCurrency,
   phaseCoins,
   cashBalances,
+  tradeCashUsd,
+  coinSalesUsd,
   onFund,
   txHistory,
   onExplore,
@@ -4797,6 +4932,18 @@ function DashboardTab({
             <span>PHASE Coins</span>
             <span className="cash-balance-value">{phaseCoins.toLocaleString()}</span>
           </div>
+          {(tradeCashUsd > 0 || coinSalesUsd > 0) && (
+            <>
+              <div className="cash-balance-chip">
+                <span className="cash-balance-currency">TRADE USD</span>
+                <span className="cash-balance-value">${tradeCashUsd.toFixed(2)}</span>
+              </div>
+              <div className="cash-balance-chip">
+                <span className="cash-balance-currency">COIN SALES</span>
+                <span className="cash-balance-value">${coinSalesUsd.toFixed(2)}</span>
+              </div>
+            </>
+          )}
           {cashEntries.length === 0 ? (
             <p className="field-hint">Nothing funded yet. Use Fund Account to add USDC or USDT from your wallet.</p>
           ) : (
