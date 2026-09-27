@@ -32,11 +32,11 @@ const issuanceApi = {
   getAgreement: (draftId) =>
     backendFetch(`/issuance/agreement?draftId=${encodeURIComponent(draftId)}`),
   signAgreement: (draftId, legalName) =>
-    backendFetch("/issuance/sign", { method: "POST", body: { draftId, legalName, accepted: true } }),
+    backendFetch("/issuance/sign", { method: "POST", body: { draftId, legalName, accepted: true, userId: "app-user" } }),
   mint: (draftId, { meme = false, idempotencyKey } = {}) =>
     backendFetch("/issuance/mint", {
       method: "POST",
-      body: { draftId, meme },
+      body: { draftId, meme, userId: "app-user" },
       idempotencyKey: idempotencyKey || `mint-${draftId}-${Date.now()}`,
     }),
 };
