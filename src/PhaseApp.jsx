@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import { checkForUpdates, dismissUpdate, UpdateDialog } from "./update-check.jsx";
 import { MARKETPLACE_LOCKED, CRYPTO_FUNDING_LOCKED, GO_LIVE_LOCKED, DASHBOARD_LOCKED } from "./feature-flags.js";
 import { generateWallet, restoreWallet, createSovereignChain } from "./sovereign-client.js";
+import { mountCardElement, confirmCardPayment } from "./stripe-client.js";
 
 /* ------------------------- Phase backend API client ------------------------- */
 // Real backend: issuance (draft → agreement → sign → mint) and funding.
@@ -76,6 +77,18 @@ const fundingApi = {
     backendFetch(`/funding/btc/address?userId=${encodeURIComponent(userId)}`),
   getBtcBalance: (userId) =>
     backendFetch(`/funding/btc/balance?userId=${encodeURIComponent(userId)}`),
+  // Stripe card funding (test mode)
+  createStripeIntent: (userId, amountMinor, currency) =>
+    backendFetch(`/stripe/payment-intents?userId=${encodeURIComponent(userId)}`, {
+      method: "POST",
+      body: { amount: amountMinor, currency, description: "Phase account funding" },
+    }),
+  confirmStripeIntent: (paymentIntentId) =>
+    backendFetch(`/stripe/payment-intents/${encodeURIComponent(paymentIntentId)}/confirm`, {
+      method: "POST",
+    }),
+  getFiatBalances: (userId) =>
+    backendFetch(`/stripe/balances?userId=${encodeURIComponent(userId)}`),
 };
 
 /* ============================================================================
@@ -3233,7 +3246,182 @@ function BringYourOwnNetworkFlow({ onBack, onPublish }) {
   );
 }
 
+/* ------------------------- Card funding (Stripe) ------------------------- */
+// Stripe.js Card Element flow: amount -> backend creates PaymentIntent ->
+// Stripe-hosted card input -> confirm -> webhook credits the ledger.
+// Test mode only.
+
+function CardFundPanel({ onFunded }) {
+  const [amount, setAmount] = useState("25");
+  const [step, setStep] = useState("entry"); // entry | card | processing | success | error
+  const [error, setError] = useState(null);
+  const [credited, setCredited] = useState(null);
+  const [clientSecret, setClientSecret] = useState(null);
+  const [intentId, setIntentId] = useState(null);
+  const cardMountRef = useRef(null);
+  const cardRef = useRef(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+      if (cardRef.current) {
+        try { cardRef.current.destroy(); } catch { /* noop */ }
+        cardRef.current = null;
+      }
+    };
+  }, []);
+
+  const amountMinor = Math.round(parseFloat(amount || "0") * 100);
+  const amountValid = Number.isFinite(amountMinor) && amountMinor >= 50 && amountMinor <= 99999999;
+
+  // Mount the Stripe Card Element when we reach the card step.
+  useEffect(() => {
+    if (step !== "card" || !cardMountRef.current || cardRef.current) return;
+    let cancelled = false;
+    mountCardElement(cardMountRef.current)
+      .then(({ card, destroy }) => {
+        if (cancelled) { destroy(); return; }
+        cardRef.current = { card, destroy };
+      })
+      .catch((e) => {
+        if (!mountedRef.current) return;
+        setError(e.message);
+        setStep("error");
+      });
+    return () => { cancelled = true; };
+  }, [step]);
+
+  const startCardStep = async () => {
+    if (!amountValid) return;
+    setStep("processing");
+    setError(null);
+    try {
+      const intent = await fundingApi.createStripeIntent("app-user", amountMinor, "cad");
+      if (!intent.client_secret) throw new Error("No client secret from backend.");
+      if (!mountedRef.current) return;
+      setClientSecret(intent.client_secret);
+      setIntentId(intent.id);
+      setStep("card");
+    } catch (e) {
+      if (!mountedRef.current) return;
+      setError(e.message || "Couldn't start payment.");
+      setStep("error");
+    }
+  };
+
+  const payNow = async () => {
+    if (!cardRef.current) return;
+    setStep("processing");
+    setError(null);
+    try {
+      await confirmCardPayment(cardRef.current.card, clientSecret);
+      // Backend polls Stripe (webhook usually beats us; confirm is idempotent).
+      const conf = await fundingApi.confirmStripeIntent(intentId);
+      if (!mountedRef.current) return;
+      const cad = (amountMinor / 100).toFixed(2);
+      setCredited(cad);
+      setStep("success");
+      onFunded && onFunded("cad", cad, "Card deposit");
+    } catch (e) {
+      if (!mountedRef.current) return;
+      setError(e.message || "Payment failed.");
+      setStep("card");
+    }
+  };
+
+  const backToEntry = () => {
+    if (cardRef.current) {
+      try { cardRef.current.destroy(); } catch { /* noop */ }
+      cardRef.current = null;
+    }
+    setStep("entry");
+    setError(null);
+  };
+
+  return (
+    <div className="card-fund-panel">
+      {step === "entry" && (
+        <>
+          <p className="section-sub">
+            Top up your Phase balance instantly. Test mode — use card{" "}
+            <span className="mono">4242 4242 4242 4242</span>, any future expiry, any CVC.
+          </p>
+          <label className="field-label">Amount (CAD)</label>
+          <div className="amount-row">
+            <span className="amount-currency">$</span>
+            <input
+              className="amount-input"
+              type="number"
+              min="0.50"
+              step="0.01"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              placeholder="25.00"
+            />
+          </div>
+          {!amountValid && amount !== "" && (
+            <p className="field-hint field-error">Enter at least CA$0.50.</p>
+          )}
+          <button
+            className="btn btn-primary btn-large btn-full"
+            onClick={startCardStep}
+            disabled={!amountValid}
+          >
+            Continue — CA${amountValid ? (amountMinor / 100).toFixed(2) : "0.00"}
+          </button>
+          <p className="field-hint">Secured by Stripe. Test mode, no real charge.</p>
+        </>
+      )}
+
+      {step === "card" && (
+        <>
+          <h3>CA{(amountMinor / 100).toFixed(2)} — card details</h3>
+          <p className="section-sub">Card data goes straight to Stripe, never our servers.</p>
+          <label className="field-label">Card</label>
+          <div ref={cardMountRef} className="stripe-card-element" />
+          {error && <p className="field-hint field-error">{error}</p>}
+          <button className="btn btn-primary btn-large btn-full" onClick={payNow}>
+            Pay CA{(amountMinor / 100).toFixed(2)}
+          </button>
+          <button className="btn btn-ghost" onClick={backToEntry}>Back</button>
+        </>
+      )}
+
+      {step === "processing" && (
+        <div className="funding-processing">
+          <span className="spinner spinner-large" />
+          <h3>Processing…</h3>
+          <p className="section-sub">Talking to Stripe. Don&apos;t close.</p>
+        </div>
+      )}
+
+      {step === "success" && (
+        <div className="funding-done">
+          <div className="funding-done-icon">
+            <Icon name="check" size={22} />
+          </div>
+          <h3>CA${credited} added!</h3>
+          <p className="section-sub">Your Phase balance is updated.</p>
+          <button className="btn btn-primary" onClick={backToEntry}>
+            Add more
+          </button>
+        </div>
+      )}
+
+      {step === "error" && (
+        <div className="funding-processing">
+          <h3>Something went wrong</h3>
+          <p className="section-sub">{error}</p>
+          <button className="btn btn-secondary" onClick={backToEntry}>Try again</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FundAccountModal({ onClose, onFund }) {
+  const [method, setMethod] = useState("card"); // card | crypto
   const [step, setStep] = useState("loading"); // loading | deposit | waiting | confirmed | error
   const [depositInfo, setDepositInfo] = useState(null);
   const [balances, setBalances] = useState(null);
@@ -3396,6 +3584,26 @@ function FundAccountModal({ onClose, onFund }) {
         {step === "deposit" && depositInfo && (
           <>
             <h3>Fund Your Account</h3>
+
+            <div className="chain-picker fund-method-tabs">
+              <button
+                className={"chain-btn" + (method === "card" ? " chain-btn-active" : "")}
+                onClick={() => setMethod("card")}
+              >
+                Card
+              </button>
+              <button
+                className={"chain-btn" + (method === "crypto" ? " chain-btn-active" : "")}
+                onClick={() => setMethod("crypto")}
+              >
+                Crypto
+              </button>
+            </div>
+
+            {method === "card" ? (
+              <CardFundPanel onFunded={onFund} />
+            ) : (
+            <>
             <p className="section-sub">
               Send {currency} from your external wallet to the address below.
               {testnet ? " Testnet funds — no real money." : ""}
@@ -3455,6 +3663,8 @@ function FundAccountModal({ onClose, onFund }) {
             <button className="btn btn-primary btn-large btn-full" onClick={startWaiting} disabled={!address}>
               I&apos;ve sent funds
             </button>
+            </>
+            )}
           </>
         )}
 
@@ -5421,6 +5631,24 @@ function GlobalStyles() {
       .file-upload-name { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: #0284c7; }
       .business-attestation { margin: 20px 0; padding: 18px; border-radius: 16px; border: 1.5px solid rgba(14,165,233,0.25); background: rgba(14,165,233,0.05); }
       .chain-picker { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 16px; }
+      .fund-method-tabs { margin: 12px 0 20px; }
+      .fund-method-tabs .chain-btn { flex: 1; text-align: center; }
+      .card-fund-panel { display: flex; flex-direction: column; }
+      .amount-row {
+        display: flex; align-items: center; gap: 8px;
+        background: rgba(255,255,255,0.6); border: 1.5px solid rgba(14,165,233,0.25);
+        border-radius: 14px; padding: 12px 16px; margin: 4px 0 8px;
+      }
+      .amount-currency { font-size: 20px; font-weight: 700; color: #0e7490; }
+      .amount-input {
+        flex: 1; border: none; background: transparent; outline: none;
+        font: inherit; font-size: 22px; font-weight: 700; color: inherit;
+      }
+      .field-error { color: #dc2626; }
+      .stripe-card-element {
+        background: rgba(255,255,255,0.6); border: 1.5px solid rgba(14,165,233,0.25);
+        border-radius: 14px; padding: 14px 16px; margin: 4px 0 16px;
+      }
       .chain-btn {
         padding: 10px 16px; border-radius: 12px; cursor: pointer;
         background: rgba(255,255,255,0.5); border: 1.5px solid rgba(14,165,233,0.2);
