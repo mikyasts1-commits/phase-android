@@ -33,10 +33,10 @@ const issuanceApi = {
     backendFetch(`/issuance/agreement?draftId=${encodeURIComponent(draftId)}`),
   signAgreement: (draftId, legalName) =>
     backendFetch("/issuance/sign", { method: "POST", body: { draftId, legalName, accepted: true, userId: "app-user" } }),
-  mint: (draftId, { meme = false, idempotencyKey } = {}) =>
+  mint: (draftId, { meme = false, idempotencyKey, issuerAddress, totalShares } = {}) =>
     backendFetch("/issuance/mint", {
       method: "POST",
-      body: { draftId, meme, userId: "app-user" },
+      body: { draftId, meme, userId: "app-user", issuerAddress, totalShares },
       idempotencyKey: idempotencyKey || `mint-${draftId}-${Date.now()}`,
     }),
 };
@@ -1681,7 +1681,7 @@ export default function App() {
               inert={GO_LIVE_LOCKED ? true : undefined}
               aria-hidden={GO_LIVE_LOCKED ? true : undefined}
             >
-              <GoLiveTab onPublish={publishAsset} />
+              <GoLiveTab onPublish={publishAsset} issuerAddress={sovereignWallet?.address} />
             </div>
           </div>
         )}
@@ -1891,7 +1891,7 @@ function ConfettiBurst() {
 
 /* =============================== GO LIVE TAB ================================ */
 
-function GoLiveTab({ onPublish }) {
+function GoLiveTab({ onPublish, issuerAddress }) {
   const [flowStep, setFlowStep] = useState("entry"); // entry | describe | bringYourOwn | form | issuance
   const [selectedPath, setSelectedPath] = useState(null); // 'capital' | 'business' | 'asset'
   const [selectedExample, setSelectedExample] = useState(null); // example object from GOLIVE_PATHS, or null for "describe my own"
@@ -2055,7 +2055,9 @@ function GoLiveTab({ onPublish }) {
           category,
           equityPublic,
           equityRetained,
+          totalShares,
         }}
+        issuerAddress={issuerAddress}
         onBack={() => setFlowStep("form")}
         onComplete={async (mintedCoin, isMeme) => {
           // Hand the real minted coin to the parent for dashboard unlock.
@@ -2513,10 +2515,11 @@ function GoLiveTab({ onPublish }) {
 // animating in large. This is the emotional high point of Go Live, so it
 // gets its own beat instead of a generic spinner.
 /* ------------------------- Real issuance flow ------------------------- */
-// Draft → choice (Issuer Agreement vs Meme Coin) → sign → mint on Solana devnet.
+// Draft → choice (Issuer Agreement vs Meme Coin) → sign → mint on your own
+// Phase sovereign chain (in-house — each coin gets its own isolated chain).
 // Uses the real Phase backend. The agreement creates a covenant between the
 // issuer and purchasers; the meme path explicitly mints with no agreement.
-function IssuanceFlow({ coin, onBack, onComplete }) {
+function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
   const [step, setStep] = useState("choice"); // choice | social | agreement | meme | minting | done | error
   const [chosenPath, setChosenPath] = useState(null); // "agreement" | "meme"
   const [socialProviders, setSocialProviders] = useState([]);
@@ -2532,6 +2535,25 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const idempotencyKey = useRef(`app-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+
+  // The sovereign chain needs the issuer's ph1 wallet address. Prefer the
+  // prop; fall back to restoring the on-device wallet from localStorage.
+  const ensureIssuerAddress = async () => {
+    if (issuerAddress) return issuerAddress;
+    try {
+      const stored = localStorage.getItem("phase_sovereign_wallet");
+      if (stored) {
+        const { jwk, pubkeyHex } = JSON.parse(stored);
+        const w = await restoreWallet(jwk, pubkeyHex);
+        if (w && w.address) return w.address;
+      }
+      const w = await generateWallet();
+      localStorage.setItem("phase_sovereign_wallet", JSON.stringify({ jwk: w.jwk, pubkeyHex: w.pubkeyHex }));
+      return w.address;
+    } catch (e) {
+      throw new Error("Could not load your Phase wallet. Please restart the app and try again.");
+    }
+  };
 
   const startDraft = async () => {
     setBusy(true);
@@ -2646,6 +2668,8 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
       const result = await issuanceApi.mint(draftId, {
         meme: false,
         idempotencyKey: idempotencyKey.current,
+        issuerAddress: await ensureIssuerAddress(),
+        totalShares: coin.totalShares,
       });
       setMintResult(result.coin);
       setStep("done");
@@ -2667,6 +2691,8 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
       const result = await issuanceApi.mint(draftId, {
         meme: true,
         idempotencyKey: idempotencyKey.current,
+        issuerAddress: await ensureIssuerAddress(),
+        totalShares: coin.totalShares,
       });
       setMintResult(result.coin);
       setStep("done");
@@ -2688,7 +2714,7 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
         </button>
         <h2 className="section-title">Issuer Agreement</h2>
         <p className="section-sub">
-          {coin.ticker} · {coin.equityPublic}% public / {coin.equityRetained}% retained · 1,000,000 shares on Solana devnet
+          {coin.ticker} · {coin.equityPublic}% public / {coin.equityRetained}% retained · {(coin.totalShares || 100000).toLocaleString()} shares on your own Phase sovereign chain
         </p>
         <p className="section-sub">
           This covenant is made for the benefit of everyone who purchases {coin.ticker}. Read it
@@ -2858,11 +2884,11 @@ function IssuanceFlow({ coin, onBack, onComplete }) {
     return (
       <div className="issuance-flow issuance-status">
         <h2 className="section-title">Minting {coin.ticker}…</h2>
-        <p className="section-sub">Writing your coin to Solana devnet. This takes a few seconds.</p>
+        <p className="section-sub">Provisioning your coin's own sovereign chain. This takes a few seconds.</p>
         <div className="provisioning-steps">
           <div className="provisioning-step provisioning-step-active">
             <span className="provisioning-step-dot" />
-            <span className="provisioning-step-label">Submitting to Solana devnet…</span>
+            <span className="provisioning-step-label">Provisioning your sovereign chain…</span>
           </div>
         </div>
       </div>
@@ -2925,26 +2951,22 @@ function IssuanceDoneScreen({ mintResult, coin, socialConns, onBack }) {
       </p>
       <div className="mint-details">
         <div className="mint-detail-row">
-          <span className="stat-label">Mint address</span>
+          <span className="stat-label">Chain ID</span>
           <span className="stat-value mono">{mintResult.mintAddress}</span>
         </div>
         <div className="mint-detail-row">
-          <span className="stat-label">Transaction</span>
+          <span className="stat-label">Genesis hash</span>
           <span className="stat-value mono">{mintResult.txSignature.slice(0, 20)}…</span>
         </div>
         <div className="mint-detail-row">
           <span className="stat-label">Supply</span>
-          <span className="stat-value">1,000,000 {mintResult.ticker}</span>
+          <span className="stat-value">{Number(mintResult.supply).toLocaleString()} {mintResult.ticker}</span>
+        </div>
+        <div className="mint-detail-row">
+          <span className="stat-label">Network</span>
+          <span className="stat-value">Phase sovereign chain</span>
         </div>
       </div>
-      <a
-        className="btn-secondary"
-        href={`https://explorer.solana.com/address/${mintResult.mintAddress}?cluster=devnet`}
-        target="_blank"
-        rel="noopener noreferrer"
-      >
-        View on Solana Explorer
-      </a>
 
       {socialConns.length > 0 && !announceResult && (
         <div className="announce-section">
