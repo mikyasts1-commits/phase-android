@@ -27,23 +27,42 @@ function phaseUserId() {
 }
 const PHASE_USER_ID = phaseUserId();
 
-async function backendFetch(path, { method = "GET", body, idempotencyKey } = {}) {
+async function backendFetch(path, { method = "GET", body, idempotencyKey, retries = 3 } = {}) {
   const headers = { "Content-Type": "application/json" };
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
-  const res = await fetch(`${PHASE_BACKEND_URL}${path}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(data.message || data.error || `Backend error ${res.status}`);
-    err.code = data.error || data.code;
-    err.status = res.status;
-    err.detail = data;
-    throw err;
+
+  // Render's free-tier instance spins down after idle and can take 50s+ to
+  // wake back up (see Render's own dashboard warning). A cold-start request
+  // often fails at the network level — fetch() throws before any response
+  // exists — rather than timing out gracefully. Retry with backoff instead
+  // of surfacing a bare "Failed to fetch" on the user's first tap.
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let res;
+    try {
+      res = await fetch(`${PHASE_BACKEND_URL}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch (networkErr) {
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 5000 * (attempt + 1)));
+        continue;
+      }
+      throw new Error(
+        "Couldn't reach Phase's servers. They may be waking up from idle — please try again in a moment."
+      );
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(data.message || data.error || `Backend error ${res.status}`);
+      err.code = data.error || data.code;
+      err.status = res.status;
+      err.detail = data;
+      throw err;
+    }
+    return data;
   }
-  return data;
 }
 
 const issuanceApi = {
