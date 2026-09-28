@@ -88,6 +88,24 @@ const tradeApi = {
     backendFetch("/trades/topup", { method: "POST", body: { userId: PHASE_USER_ID, amountUsd } }),
 };
 
+// Issuer directory + coin-for-coin swaps: the "issuers online" marketplace.
+// GET /marketplace/coins lists every issued sovereign coin (own + others).
+// POST /trades/swap offers units of your own coin in exchange for another's.
+const marketApi = {
+  directory: () => backendFetch("/marketplace/coins"),
+  myCoins: () => backendFetch(`/issuance/coins?userId=${encodeURIComponent(PHASE_USER_ID)}`),
+  chainBalance: (chainId, address) =>
+    backendFetch(
+      `/sovereign/chains/${encodeURIComponent(chainId)}/balances/${encodeURIComponent(address)}`
+    ),
+  swap: (targetChainId, { offerChainId, offerUnits, buyerAddress, idempotencyKey } = {}) =>
+    backendFetch("/trades/swap", {
+      method: "POST",
+      body: { userId: PHASE_USER_ID, chainId: targetChainId, buyerAddress, offerChainId, offerUnits },
+      idempotencyKey: idempotencyKey || `swap-${targetChainId}-${Date.now()}`,
+    }),
+};
+
 const socialApi = {  getProviders: () => backendFetch("/social/providers"),
   getAuthorizeUrl: (provider, userId) =>
     backendFetch(`/social/${provider}/authorize?userId=${encodeURIComponent(userId)}`),
@@ -1340,6 +1358,20 @@ function Icon({ name, size = 18 }) {
           <circle cx="12" cy="15.2" r="1.2" fill="currentColor" />
         </svg>
       );
+    case "search":
+      return (
+        <svg {...common}>
+          <circle cx="11" cy="11" r="6.5" stroke="currentColor" strokeWidth="1.6" />
+          <path d="M15.8 15.8L20 20" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+      );
+    case "refresh":
+      return (
+        <svg {...common}>
+          <path d="M20 12a8 8 0 1 1-2.3-5.6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+          <path d="M20 3.5V8h-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
     default:
       return null;
   }
@@ -1640,6 +1672,9 @@ export default function App() {
     // the issuer when someone buys their coin.
     const isSovereign = asset.chainId && String(asset.chainId).startsWith("ch_");
     if (isSovereign) {
+      // Register directory coins in the asset registry so Dashboard
+      // holdings enrichment can find them after the trade.
+      setAssets((prev) => (prev.some((a) => a.id === asset.id) ? prev : [...prev, asset]));
       if (!sovereignWallet?.address) {
         showToast("Your Phase wallet isn't ready yet — try again in a moment");
         return;
@@ -1739,6 +1774,66 @@ export default function App() {
     );
   };
 
+  // Coin-for-coin swap: offer units of your own issued coin in exchange for
+  // another issuer's coin. Settles on both sovereign chains via the backend.
+  const investSwap = async (asset, offerCoin, offerUnits) => {
+    if (offerUnits < 1) return;
+    setAssets((prev) => {
+      let next = prev;
+      for (const a of [asset, offerCoin]) {
+        if (a && !next.some((x) => x.id === a.id)) next = [...next, a];
+      }
+      return next;
+    });
+    if (!sovereignWallet?.address) {
+      showToast("Your Phase wallet isn't ready yet — try again in a moment");
+      return;
+    }
+    try {
+      const res = await marketApi.swap(asset.chainId, {
+        offerChainId: offerCoin.chainId,
+        offerUnits,
+        buyerAddress: sovereignWallet.address,
+      });
+      const t = res.trade || {};
+      const gotUnits = Number(t.units) || 0;
+      const paidUnits = Number(t.offerUnits) || offerUnits;
+      const valueUsd = Number(t.amountUsd) || 0;
+      setHoldings((prev) => {
+        const bump = (list, assetId, deltaUnits, usd) => {
+          const existing = list.find((h) => h.assetId === assetId);
+          if (existing) {
+            return list.map((h) =>
+              h.assetId === assetId
+                ? { ...h, units: Math.max(0, h.units + deltaUnits), costBasisUsd: h.costBasisUsd + usd }
+                : h
+            );
+          }
+          if (deltaUnits <= 0) return list;
+          return [...list, { assetId, units: deltaUnits, costBasisUsd: usd }];
+        };
+        let next = bump(prev, asset.id, gotUnits, valueUsd);
+        next = bump(next, offerCoin.assetId, -paidUnits, 0);
+        return next;
+      });
+      setTxHistory((prev) => [
+        {
+          id: uid(),
+          assetName: `${asset.ticker} ⇄ ${offerCoin.ticker}`,
+          amountUsd: valueUsd,
+          currency: "usd",
+          time: new Date(),
+          type: "swap",
+          txId: res.targetTxId || t.txId,
+        },
+        ...prev,
+      ]);
+      showToast(`Swapped ${paidUnits} ${offerCoin.ticker} → ${gotUnits} ${asset.ticker}`);
+    } catch (e) {
+      showToast(e.message || "Swap failed — please try again");
+    }
+  };
+
   const fundAccount = (currencyId, amountInCurrency, method) => {
     if (amountInCurrency <= 0) return;
     setCryptoFunded(true); // real deposit confirmed — unlock the dashboard
@@ -1806,6 +1901,8 @@ export default function App() {
             currency={currency}
             setCurrency={setCurrency}
             onInvest={invest}
+            onInvestSwap={investSwap}
+            sovereignAddress={sovereignWallet?.address}
             phaseCoins={phaseCoins}
             cashBalances={cashBalances}
             liveFx={liveFx}
@@ -4048,7 +4145,183 @@ function CategoryPicker({ counts, onPick }) {
   );
 }
 
-function MarketplaceTab({ assets, currency, setCurrency, onInvest, phaseCoins, cashBalances, liveFx, tradeCashUsd, onTopup }) {
+// Compact issuer id for display: first 6 chars of the per-install user id.
+const issuerTag = (userId) =>
+  userId === PHASE_USER_ID ? "You" : `Issuer ${String(userId || "").slice(0, 6)}…`;
+
+// One row in the issuer directory: online dot, identity, key numbers,
+// and Buy / Compare actions.
+function DirectoryCoinCard({ coin, inCompare, onToggleCompare, onDetail, onBuy }) {
+  const mcap = (Number(coin.priceUsd) || 0) * (Number(coin.supply) || 0);
+  const floatAvail = coin.floatAvailable != null ? Number(coin.floatAvailable) : null;
+  return (
+    <div className="glass-card dir-coin-card">
+      <button className="dir-coin-main" onClick={onDetail} aria-label={`Details for ${coin.name}`}>
+        <span className="online-dot" title="Online" />
+        <div className="dir-coin-id">
+          <div className="dir-coin-avatar">{String(coin.ticker || "?").slice(0, 2).toUpperCase()}</div>
+          <div className="dir-coin-names">
+            <div className="holdings-name">
+              {coin.name}
+              <span className="ticker-tag">{coin.ticker}</span>
+            </div>
+            <div className="dir-coin-sub">
+              {coin.mine ? "Your issuance" : issuerTag(coin.issuerUserId)}
+              {" · "}
+              {coin.hasAgreement ? "Agreement signed" : coin.isMeme ? "Meme coin" : "No agreement"}
+            </div>
+          </div>
+        </div>
+        <div className="dir-coin-stats">
+          <span className="price-text-sm">${(Number(coin.priceUsd) || 0).toFixed(2)}</span>
+          <span className="dir-coin-mcap">MCap ${formatCount(mcap)}</span>
+          {floatAvail != null && <span className="dir-coin-float">{formatCount(floatAvail)} available</span>}
+        </div>
+      </button>
+      <div className="dir-coin-actions">
+        {!coin.mine && (
+          <button className="pill-btn pill-btn-active dir-buy-btn" onClick={onBuy}>
+            Buy
+          </button>
+        )}
+        <button
+          className={`pill-btn ${inCompare ? "pill-btn-active" : ""}`}
+          onClick={onToggleCompare}
+        >
+          {inCompare ? "✓ Comparing" : "Compare"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Full key information for one coin — everything needed to decide.
+function CoinDetailModal({ coin, inCompare, onToggleCompare, onClose, onBuy }) {
+  const mcap = (Number(coin.priceUsd) || 0) * (Number(coin.supply) || 0);
+  const floatAvail = coin.floatAvailable != null ? Number(coin.floatAvailable) : null;
+  const issuedOn = coin.createdAt ? new Date(coin.createdAt).toLocaleDateString() : "—";
+  const rows = [
+    ["Price per coin", `$${(Number(coin.priceUsd) || 0).toFixed(2)}`],
+    ["Market cap", `$${formatCount(mcap)}`],
+    ["Total supply", formatCount(Number(coin.supply) || 0)],
+    ["Available to buy", floatAvail != null ? `${formatCount(floatAvail)} ${coin.ticker}` : "—"],
+    ["Issuer", coin.mine ? "You (this install)" : issuerTag(coin.issuerUserId)],
+    ["Agreement", coin.hasAgreement ? "Signed ✓" : coin.isMeme ? "Meme — none required" : "None"],
+    ["Coin type", coin.isMeme ? "Meme" : coin.category || "Sovereign"],
+    ["Issued", issuedOn],
+    ["Status", "● Online"],
+  ];
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card coin-detail-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="icon-btn modal-close" onClick={onClose}>
+          <Icon name="close" size={18} />
+        </button>
+        <div className="dir-coin-id coin-detail-head">
+          <div className="dir-coin-avatar dir-coin-avatar-lg">
+            {String(coin.ticker || "?").slice(0, 2).toUpperCase()}
+          </div>
+          <div>
+            <h3>
+              {coin.name} <span className="ticker-tag">{coin.ticker}</span>
+            </h3>
+            <p className="section-sub">
+              {coin.mine ? "Your issuance" : issuerTag(coin.issuerUserId)} · sovereign chain
+            </p>
+          </div>
+        </div>
+        <div className="coin-detail-rows">
+          {rows.map(([label, value]) => (
+            <div className="coin-detail-row" key={label}>
+              <span className="stat-label">{label}</span>
+              <span className="coin-detail-value">{value}</span>
+            </div>
+          ))}
+        </div>
+        <div className="coin-detail-actions">
+          {!coin.mine && (
+            <button className="pill-btn pill-btn-active" onClick={onBuy}>
+              Buy {coin.ticker}
+            </button>
+          )}
+          <button
+            className={`pill-btn ${inCompare ? "pill-btn-active" : ""}`}
+            onClick={onToggleCompare}
+          >
+            {inCompare ? "✓ Comparing" : "Add to compare"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Side-by-side comparison of up to 3 coins.
+function CompareModal({ coins, onRemove, onClose, onBuy }) {
+  const mcap = (c) => (Number(c.priceUsd) || 0) * (Number(c.supply) || 0);
+  const rows = [
+    ["Price", (c) => `$${(Number(c.priceUsd) || 0).toFixed(2)}`],
+    ["Market cap", (c) => `$${formatCount(mcap(c))}`],
+    ["Supply", (c) => formatCount(Number(c.supply) || 0)],
+    ["Available", (c) => (c.floatAvailable != null ? formatCount(Number(c.floatAvailable)) : "—")],
+    ["Issuer", (c) => (c.mine ? "You" : issuerTag(c.issuerUserId))],
+    ["Agreement", (c) => (c.hasAgreement ? "Signed ✓" : c.isMeme ? "Meme" : "None")],
+    ["Type", (c) => (c.isMeme ? "Meme" : c.category || "Sovereign")],
+    ["Issued", (c) => (c.createdAt ? new Date(c.createdAt).toLocaleDateString() : "—")],
+  ];
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card compare-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="icon-btn modal-close" onClick={onClose}>
+          <Icon name="close" size={18} />
+        </button>
+        <h3>Compare coins</h3>
+        <p className="section-sub">Side-by-side, so you can decide.</p>
+        <div className="compare-table-wrap">
+          <table className="compare-table">
+            <thead>
+              <tr>
+                <th />
+                {coins.map((c) => (
+                  <th key={c.chainId}>
+                    <div className="compare-head">
+                      <span className="ticker-tag">{c.ticker}</span>
+                      <button className="icon-btn" onClick={() => onRemove(c.chainId)} aria-label={`Remove ${c.ticker}`}>
+                        <Icon name="close" size={12} />
+                      </button>
+                    </div>
+                    <div className="compare-name">{c.name}</div>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(([label, get]) => (
+                <tr key={label}>
+                  <td className="stat-label">{label}</td>
+                  {coins.map((c) => (
+                    <td key={c.chainId}>{get(c)}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="coin-detail-actions">
+          {coins
+            .filter((c) => !c.mine)
+            .map((c) => (
+              <button key={c.chainId} className="pill-btn" onClick={() => onBuy(c)}>
+                Buy {c.ticker}
+              </button>
+            ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap, sovereignAddress, phaseCoins, cashBalances, liveFx, tradeCashUsd, onTopup }) {
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [marketEntry, setMarketEntry] = useState("select"); // select (dropdown) | browse (all category cards)
   const [subsectionFilter, setSubsectionFilter] = useState("all");
@@ -4056,6 +4329,82 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, phaseCoins, c
   const [expandedId, setExpandedId] = useState(null);
   const [financialsAsset, setFinancialsAsset] = useState(null);
   const [activeAsset, setActiveAsset] = useState(null);
+
+  // Issuer directory: every sovereign coin issued and online — other
+  // issuers as well as this install's own issuances, in one seamless list.
+  const [dirCoins, setDirCoins] = useState([]);
+  const [dirLoading, setDirLoading] = useState(true);
+  const [dirError, setDirError] = useState(null);
+  const [dirQuery, setDirQuery] = useState("");
+  const [dirFilter, setDirFilter] = useState("all"); // all | mine | others
+  const [myCoinList, setMyCoinList] = useState([]); // this install's own issued coins
+  const [detailCoin, setDetailCoin] = useState(null);
+  const [compareIds, setCompareIds] = useState([]); // chainIds, max 3
+  const [compareOpen, setCompareOpen] = useState(false);
+
+  const refreshDirectory = useCallback(async () => {
+    setDirLoading(true);
+    setDirError(null);
+    try {
+      const [dir, mine] = await Promise.all([
+        marketApi.directory().catch(() => ({ coins: [] })),
+        marketApi.myCoins().catch(() => ({ coins: [] })),
+      ]);
+      const coins = (dir.coins || []).map((c) => ({
+        ...c,
+        id: `coin-${c.chainId}`,
+        assetId: `coin-${c.chainId}`,
+        price: Number(c.priceUsd) || 0,
+        tagline: `${c.name} — sovereign coin`,
+        mine: c.issuerUserId === PHASE_USER_ID,
+      }));
+      setDirCoins(coins);
+      setMyCoinList(
+        (mine.coins || []).map((c) => ({
+          ...c,
+          id: `coin-${c.mintAddress}`,
+          chainId: c.mintAddress,
+          assetId: `coin-${c.mintAddress}`,
+          price: Number(c.priceUsd) || 0,
+          tagline: `${c.name} — your sovereign coin`,
+          mine: true,
+        }))
+      );
+    } catch (e) {
+      setDirError(e.message || "Couldn't load the directory");
+    } finally {
+      setDirLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshDirectory();
+  }, [refreshDirectory]);
+
+  const toggleCompare = (chainId) => {
+    setCompareIds((prev) =>
+      prev.includes(chainId)
+        ? prev.filter((id) => id !== chainId)
+        : prev.length >= 3
+          ? prev
+          : [...prev, chainId]
+    );
+  };
+
+  const dirFiltered = useMemo(() => {
+    const q = dirQuery.trim().toLowerCase();
+    return dirCoins.filter((c) => {
+      if (dirFilter === "mine" && !c.mine) return false;
+      if (dirFilter === "others" && c.mine) return false;
+      if (!q) return true;
+      return `${c.name} ${c.ticker} ${c.issuerUserId || ""}`.toLowerCase().includes(q);
+    });
+  }, [dirCoins, dirQuery, dirFilter]);
+
+  const compareCoins = useMemo(
+    () => compareIds.map((id) => dirCoins.find((c) => c.chainId === id)).filter(Boolean),
+    [compareIds, dirCoins]
+  );
 
   const availableSubsections =
     categoryFilter !== "all" ? ASSET_CATEGORIES[categoryFilter].subsections : [];
@@ -4113,6 +4462,84 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, phaseCoins, c
       <div className="market-header">
         <h2 className="section-title">The Live Directory</h2>
         <CurrencyDropdown currency={currency} setCurrency={setCurrency} />
+      </div>
+
+      {/* Issuer search — every Phase issuer that is live, own + others. */}
+      <div className="dir-section">
+        <div className="dir-search-row">
+          <div className="dir-search-wrap">
+            <Icon name="search" size={16} />
+            <input
+              className="dir-search"
+              placeholder="Search coins, tickers, issuers…"
+              value={dirQuery}
+              onChange={(e) => setDirQuery(e.target.value)}
+            />
+          </div>
+          <button className="icon-btn dir-refresh" onClick={refreshDirectory} aria-label="Refresh directory">
+            <Icon name="refresh" size={16} />
+          </button>
+        </div>
+        <div className="dir-pills">
+          {[
+            ["all", "All live"],
+            ["mine", "My coins"],
+            ["others", "Others' coins"],
+          ].map(([id, label]) => (
+            <button
+              key={id}
+              className={`pill-btn ${dirFilter === id ? "pill-btn-active" : ""}`}
+              onClick={() => setDirFilter(id)}
+            >
+              {label}
+            </button>
+          ))}
+          {compareIds.length > 0 && (
+            <button className="pill-btn dir-compare-btn" onClick={() => setCompareOpen(true)}>
+              Compare ({compareIds.length})
+            </button>
+          )}
+        </div>
+
+        {dirLoading ? (
+          <div className="glass-card dir-loading">
+            <p className="section-sub">Loading live issuers…</p>
+          </div>
+        ) : dirError ? (
+          <div className="glass-card empty-state">
+            <h3>Directory unavailable</h3>
+            <p>{dirError}</p>
+            <button className="pill-btn" onClick={refreshDirectory}>Retry</button>
+          </div>
+        ) : dirFiltered.length === 0 ? (
+          <div className="glass-card empty-state">
+            <Icon name="directory" size={32} />
+            <h3>No issuers match</h3>
+            <p>
+              {dirCoins.length === 0
+                ? "No coins have been issued yet — be the first from Go Live."
+                : "Try a different search or filter."}
+            </p>
+          </div>
+        ) : (
+          <div className="dir-coin-list">
+            {dirFiltered.map((coin) => (
+              <DirectoryCoinCard
+                key={coin.chainId}
+                coin={coin}
+                inCompare={compareIds.includes(coin.chainId)}
+                onToggleCompare={() => toggleCompare(coin.chainId)}
+                onDetail={() => setDetailCoin(coin)}
+                onBuy={() => setActiveAsset(coin)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* The wider category marketplace, one level below the issuer search. */}
+      <div className="market-browse-divider">
+        <span>Browse the wider marketplace</span>
       </div>
 
       {categoryFilter === "all" ? (
@@ -4190,11 +4617,42 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, phaseCoins, c
           cashBalances={cashBalances}
           liveFx={liveFx}
           tradeCashUsd={tradeCashUsd}
+          sovereignAddress={sovereignAddress}
+          myCoins={myCoinList}
           onTopup={onTopup}
           onClose={() => setActiveAsset(null)}
           onInvest={(amount, payCurrency) => {
             onInvest(activeAsset, amount, payCurrency);
             setActiveAsset(null);
+          }}
+          onInvestSwap={(offerCoin, offerUnits) => {
+            onInvestSwap(activeAsset, offerCoin, offerUnits);
+            setActiveAsset(null);
+          }}
+        />
+      )}
+
+      {detailCoin && (
+        <CoinDetailModal
+          coin={detailCoin}
+          inCompare={compareIds.includes(detailCoin.chainId)}
+          onToggleCompare={() => toggleCompare(detailCoin.chainId)}
+          onClose={() => setDetailCoin(null)}
+          onBuy={() => {
+            setActiveAsset(detailCoin);
+            setDetailCoin(null);
+          }}
+        />
+      )}
+
+      {compareOpen && compareCoins.length > 0 && (
+        <CompareModal
+          coins={compareCoins}
+          onRemove={(chainId) => toggleCompare(chainId)}
+          onClose={() => setCompareOpen(false)}
+          onBuy={(coin) => {
+            setActiveAsset(coin);
+            setCompareOpen(false);
           }}
         />
       )}
@@ -4662,19 +5120,62 @@ function FinancialsModal({ asset, currency, liveFx, onClose, onInvest }) {
   );
 }
 
-function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, onTopup, onClose, onInvest }) {
+const QUICK_AMOUNTS = [10, 25, 50, 100, 250];
+
+function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, sovereignAddress, myCoins, onTopup, onClose, onInvest, onInvestSwap }) {
   const [amount, setAmount] = useState("");
   const [usePhase, setUsePhase] = useState(true);
   const [payCurrency, setPayCurrency] = useState("usd");
   const [toppingUp, setToppingUp] = useState(false);
+  // Sovereign pay method: "usd" (Trade USD, issuer gets paid) or "coin"
+  // (offer units of your own issued coin in exchange).
+  const [sovPay, setSovPay] = useState("usd");
+  const [offerCoinId, setOfferCoinId] = useState("");
+  const [offerUnits, setOfferUnits] = useState("");
+  const [offerBalances, setOfferBalances] = useState({});
+  const [balancesLoading, setBalancesLoading] = useState(false);
 
-  // Sovereign coins settle for real: buyer USD -> issuer USD on the backend,
-  // plus coins move on the coin's own chain. Only Trade USD is accepted.
+  // Sovereign coins settle for real on the backend: buyer USD -> issuer USD
+  // plus coins move on the coin's own chain — or a coin-for-coin swap.
   const isSovereign = asset.chainId && String(asset.chainId).startsWith("ch_");
 
   const effectivePayId = isSovereign ? "trade-usd" : usePhase ? "phase" : payCurrency;
   const numericAmount = parseFloat(amount) || 0;
+  const numericOfferUnits = Math.floor(parseFloat(offerUnits) || 0);
   const availableInPayCurrency = isSovereign ? tradeCashUsd || 0 : cashBalances[payCurrency] || 0;
+
+  // Coins this install issued that can be offered (never the target itself).
+  const offerableCoins = (myCoins || []).filter((c) => c.chainId !== asset.chainId);
+  const offerCoin = offerableCoins.find((c) => c.chainId === offerCoinId) || null;
+  const offerBalance = offerCoin ? offerBalances[offerCoin.chainId] || 0 : 0;
+
+  // Load on-chain balances of the user's own coins when the coin tab opens.
+  useEffect(() => {
+    if (!isSovereign || sovPay !== "coin" || !sovereignAddress || offerableCoins.length === 0) return;
+    if (Object.keys(offerBalances).length > 0) return;
+    setBalancesLoading(true);
+    Promise.all(
+      offerableCoins.map((c) =>
+        marketApi
+          .chainBalance(c.chainId, sovereignAddress)
+          .then((r) => [c.chainId, Math.floor(Number(r.balance || 0) / 1e6)])
+          .catch(() => [c.chainId, 0])
+      )
+    ).then((pairs) => {
+      const map = {};
+      pairs.forEach(([id, bal]) => {
+        map[id] = bal;
+      });
+      setOfferBalances(map);
+      setBalancesLoading(false);
+      const first = offerableCoins.find((c) => (map[c.chainId] || 0) > 0) || offerableCoins[0];
+      if (first) setOfferCoinId(first.chainId);
+    });
+  }, [isSovereign, sovPay, sovereignAddress]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const offerValueUsd = offerCoin ? numericOfferUnits * (Number(offerCoin.priceUsd) || 0) : 0;
+  const swapReceiveUnits =
+    offerValueUsd > 0 && asset.price > 0 ? Math.floor(offerValueUsd / asset.price) : 0;
 
   const handleTopup = async () => {
     setToppingUp(true);
@@ -4684,6 +5185,9 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, on
       setToppingUp(false);
     }
   };
+
+  const usdUnitsPreview =
+    numericAmount > 0 && asset.price > 0 ? Math.floor(numericAmount / asset.price) : 0;
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -4702,90 +5206,222 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, on
         <label className="field-label">Pay with</label>
         {isSovereign ? (
           <>
-            <p className="field-hint">
-              Trade USD balance: <strong>${(tradeCashUsd || 0).toFixed(2)}</strong>
-              {" — "}your payment goes straight to the coin issuer.
-            </p>
-            {(tradeCashUsd || 0) < (parseFloat(amount) || 0) && (
+            <div className="platform-pills">
               <button
-                className="pill-btn"
-                style={{ marginTop: 6 }}
-                disabled={toppingUp}
-                onClick={handleTopup}
+                className={`pill-btn ${sovPay === "usd" ? "pill-btn-active" : ""}`}
+                onClick={() => setSovPay("usd")}
               >
-                {toppingUp ? "Adding…" : "Add $1,000 test funds"}
+                Trade USD
               </button>
+              <button
+                className={`pill-btn ${sovPay === "coin" ? "pill-btn-active" : ""}`}
+                onClick={() => setSovPay("coin")}
+              >
+                My coins
+              </button>
+            </div>
+
+            {sovPay === "usd" ? (
+              <>
+                <p className="field-hint">
+                  Trade USD balance: <strong>${(tradeCashUsd || 0).toFixed(2)}</strong>
+                  {" — "}your payment goes straight to the coin issuer.
+                </p>
+                {(tradeCashUsd || 0) < numericAmount && (
+                  <button
+                    className="pill-btn"
+                    style={{ marginTop: 6 }}
+                    disabled={toppingUp}
+                    onClick={handleTopup}
+                  >
+                    {toppingUp ? "Adding…" : "Add $1,000 test funds"}
+                  </button>
+                )}
+
+                <label className="field-label">Amount (in USD)</label>
+                <div className="quick-amounts">
+                  {QUICK_AMOUNTS.map((q) => (
+                    <button
+                      key={q}
+                      className={`pill-btn ${numericAmount === q ? "pill-btn-active" : ""}`}
+                      onClick={() => setAmount(String(q))}
+                    >
+                      ${q}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  className="text-input"
+                  type="number"
+                  placeholder="Or enter a custom amount"
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                />
+                {numericAmount > 0 && (
+                  <p className="field-hint">
+                    You'll receive approximately {usdUnitsPreview} coins.
+                  </p>
+                )}
+
+                <button
+                  className={`btn-primary btn-large btn-full ${numericAmount <= 0 ? "btn-disabled" : ""}`}
+                  disabled={numericAmount <= 0}
+                  onClick={() => onInvest(numericAmount, effectivePayId)}
+                >
+                  Invest Instantly
+                </button>
+              </>
+            ) : offerableCoins.length === 0 ? (
+              <div className="glass-card empty-state">
+                <h3>No coins to offer yet</h3>
+                <p>Issue your own coin from Go Live, then offer it here in exchange.</p>
+              </div>
+            ) : (
+              <>
+                <p className="field-hint">
+                  Offer units of a coin you issued — the issuer receives your coins,
+                  you receive {asset.ticker}.
+                </p>
+                <label className="field-label">Your coin</label>
+                <select
+                  className="text-input"
+                  value={offerCoinId}
+                  onChange={(e) => setOfferCoinId(e.target.value)}
+                >
+                  {offerableCoins.map((c) => (
+                    <option key={c.chainId} value={c.chainId}>
+                      {c.ticker} — {c.name}
+                      {offerBalances[c.chainId] != null
+                        ? ` (${offerBalances[c.chainId].toLocaleString()} avail.)`
+                        : ""}
+                    </option>
+                  ))}
+                </select>
+                {balancesLoading && <p className="field-hint">Loading your coin balances…</p>}
+
+                <label className="field-label">Offer units</label>
+                <div className="offer-units-row">
+                  <input
+                    className="text-input"
+                    type="number"
+                    min="1"
+                    step="1"
+                    placeholder="Whole coins"
+                    value={offerUnits}
+                    onChange={(e) => setOfferUnits(e.target.value)}
+                  />
+                  <button
+                    className="pill-btn"
+                    disabled={!offerCoin || offerBalance <= 0}
+                    onClick={() => setOfferUnits(String(offerBalance))}
+                  >
+                    Max
+                  </button>
+                </div>
+                {offerCoin && numericOfferUnits > 0 && (
+                  <p className="field-hint">
+                    Offer {numericOfferUnits.toLocaleString()} {offerCoin.ticker} (≈ $
+                    {offerValueUsd.toFixed(2)}) → receive ≈ {swapReceiveUnits.toLocaleString()}{" "}
+                    {asset.ticker}.
+                    {numericOfferUnits > offerBalance &&
+                      ` — you only hold ${offerBalance.toLocaleString()}.`}
+                  </p>
+                )}
+
+                <button
+                  className={`btn-primary btn-large btn-full ${
+                    numericOfferUnits < 1 || numericOfferUnits > offerBalance || swapReceiveUnits < 1
+                      ? "btn-disabled"
+                      : ""
+                  }`}
+                  disabled={
+                    numericOfferUnits < 1 || numericOfferUnits > offerBalance || swapReceiveUnits < 1
+                  }
+                  onClick={() => onInvestSwap(offerCoin, numericOfferUnits)}
+                >
+                  Offer {offerCoin ? offerCoin.ticker : "coins"}
+                </button>
+              </>
             )}
           </>
         ) : (
-        <>
-        <div className="platform-pills">
-          <button
-            className={`pill-btn ${usePhase ? "pill-btn-active" : ""}`}
-            onClick={() => setUsePhase(true)}
-          >
-            PHASE Coins
-          </button>
-          <button
-            className={`pill-btn ${!usePhase ? "pill-btn-active" : ""}`}
-            onClick={() => setUsePhase(false)}
-          >
-            Other Currency
-          </button>
-        </div>
-
-        {usePhase ? (
-          <p className="field-hint">Available: {phaseCoins.toLocaleString()} PHASE Coins</p>
-        ) : (
           <>
-            <div style={{ margin: "8px 0 4px" }}>
-              <CurrencyDropdown currency={payCurrency} setCurrency={setPayCurrency} excludeIds={["phase"]} />
+            <div className="platform-pills">
+              <button
+                className={`pill-btn ${usePhase ? "pill-btn-active" : ""}`}
+                onClick={() => setUsePhase(true)}
+              >
+                PHASE Coins
+              </button>
+              <button
+                className={`pill-btn ${!usePhase ? "pill-btn-active" : ""}`}
+                onClick={() => setUsePhase(false)}
+              >
+                Other Currency
+              </button>
             </div>
-            <p className="field-hint">
-              Available: {formatCurrency(availableInPayCurrency / (liveFx[payCurrency] || 1), payCurrency, liveFx)}
-              {availableInPayCurrency <= 0 && " — fund your account from the Dashboard to invest with cash"}
-            </p>
-          </>
-        )}
-        </>
-        )}
 
-        <label className="field-label">Amount {isSovereign ? "(in USD)" : !usePhase && `(in ${payCurrency.toUpperCase()})`}</label>
-        <input
-          className="text-input"
-          type="number"
-          placeholder="Enter an amount"
-          value={amount}
-          onChange={(e) => setAmount(e.target.value)}
-        />
+            {usePhase ? (
+              <p className="field-hint">Available: {phaseCoins.toLocaleString()} PHASE Coins</p>
+            ) : (
+              <>
+                <div style={{ margin: "8px 0 4px" }}>
+                  <CurrencyDropdown currency={payCurrency} setCurrency={setPayCurrency} excludeIds={["phase"]} />
+                </div>
+                <p className="field-hint">
+                  Available: {formatCurrency(availableInPayCurrency / (liveFx[payCurrency] || 1), payCurrency, liveFx)}
+                  {availableInPayCurrency <= 0 && " — fund your account from the Dashboard to invest with cash"}
+                </p>
+              </>
+            )}
 
-        {numericAmount > 0 && (
-          <p className="field-hint">
-            You'll receive approximately{" "}
-            {isSovereign
-              ? `${Math.floor(numericAmount / asset.price)}`
-              : (
+            <label className="field-label">
+              Amount {!usePhase && `(in ${payCurrency.toUpperCase()})`}
+            </label>
+            <div className="quick-amounts">
+              {QUICK_AMOUNTS.map((q) => (
+                <button
+                  key={q}
+                  className={`pill-btn ${numericAmount === q ? "pill-btn-active" : ""}`}
+                  onClick={() => setAmount(String(q))}
+                >
+                  ${q}
+                </button>
+              ))}
+            </div>
+            <input
+              className="text-input"
+              type="number"
+              placeholder="Or enter a custom amount"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+            />
+
+            {numericAmount > 0 && (
+              <p className="field-hint">
+                You'll receive approximately{" "}
+                {(
                   (usePhase ? numericAmount / (liveFx.phase || BASE_FX.phase) : numericAmount / (liveFx[payCurrency] || 1)) /
                   asset.price
                 ).toFixed(4)}{" "}
-            {isSovereign ? "coins" : "shares"}.
-          </p>
-        )}
+                shares.
+              </p>
+            )}
 
-        <button
-          className={`btn-primary btn-large btn-full ${numericAmount <= 0 ? "btn-disabled" : ""}`}
-          disabled={numericAmount <= 0}
-          onClick={() => {
-            const amountUsd = isSovereign
-              ? numericAmount
-              : usePhase
-                ? numericAmount / (liveFx.phase || BASE_FX.phase)
-                : numericAmount / (liveFx[payCurrency] || 1);
-            onInvest(amountUsd, effectivePayId);
-          }}
-        >
-          Invest Instantly
-        </button>
+            <button
+              className={`btn-primary btn-large btn-full ${numericAmount <= 0 ? "btn-disabled" : ""}`}
+              disabled={numericAmount <= 0}
+              onClick={() => {
+                const amountUsd = usePhase
+                  ? numericAmount / (liveFx.phase || BASE_FX.phase)
+                  : numericAmount / (liveFx[payCurrency] || 1);
+                onInvest(amountUsd, effectivePayId);
+              }}
+            >
+              Invest Instantly
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -5509,6 +6145,89 @@ function GlobalStyles() {
       .pill-btn-active { background: var(--violet); color: white; border-color: var(--violet); }
       .filter-pills { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
       .platform-pills { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+
+      /* ---------------- Issuer directory (marketplace top search) ---------------- */
+      .dir-section { margin-bottom: 22px; }
+      .dir-search-row { display: flex; gap: 8px; margin-bottom: 10px; }
+      .dir-search-wrap {
+        flex: 1; display: flex; align-items: center; gap: 8px;
+        background: rgba(255,255,255,0.75); border: 1px solid rgba(14,165,233,0.22);
+        border-radius: 14px; padding: 0 12px; color: var(--navy);
+      }
+      .dir-search {
+        flex: 1; border: none; outline: none; background: transparent;
+        font-family: 'Outfit'; font-size: 14px; color: var(--navy); padding: 11px 0;
+      }
+      .dir-search::placeholder { color: rgba(30,58,95,0.45); }
+      .dir-refresh { flex-shrink: 0; }
+      .dir-pills { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+      .dir-compare-btn { border-style: dashed; }
+      .dir-loading { padding: 18px; text-align: center; }
+      .dir-coin-list { display: flex; flex-direction: column; gap: 10px; }
+      .dir-coin-card { padding: 12px 14px; }
+      .dir-coin-main {
+        width: 100%; display: flex; align-items: center; gap: 10px;
+        background: none; border: none; padding: 0; cursor: pointer; text-align: left;
+        font-family: 'Outfit'; color: var(--navy);
+      }
+      .online-dot {
+        width: 9px; height: 9px; border-radius: 50%; background: #22c55e; flex-shrink: 0;
+        box-shadow: 0 0 0 3px rgba(34,197,94,0.18); animation: pulseDot 2s infinite;
+      }
+      @keyframes pulseDot {
+        0%, 100% { box-shadow: 0 0 0 3px rgba(34,197,94,0.18); }
+        50% { box-shadow: 0 0 0 6px rgba(34,197,94,0.08); }
+      }
+      .dir-coin-id { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+      .dir-coin-avatar {
+        width: 38px; height: 38px; border-radius: 12px; flex-shrink: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: linear-gradient(135deg, var(--sky-500), var(--violet));
+        color: white; font-weight: 700; font-size: 13px;
+      }
+      .dir-coin-avatar-lg { width: 48px; height: 48px; font-size: 16px; border-radius: 14px; }
+      .dir-coin-names { min-width: 0; }
+      .dir-coin-sub { font-size: 11.5px; opacity: 0.6; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .dir-coin-stats { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; flex-shrink: 0; }
+      .dir-coin-mcap { font-size: 11.5px; opacity: 0.65; font-weight: 600; }
+      .dir-coin-float { font-size: 11px; color: #16a34a; font-weight: 600; }
+      .dir-coin-actions { display: flex; gap: 8px; margin-top: 10px; }
+      .dir-buy-btn { flex: 1; text-align: center; }
+
+      .market-browse-divider {
+        display: flex; align-items: center; gap: 12px; margin: 6px 0 16px;
+        color: rgba(30,58,95,0.55); font-family: 'Outfit'; font-size: 12.5px; font-weight: 600;
+        text-transform: uppercase; letter-spacing: 0.06em;
+      }
+      .market-browse-divider::before, .market-browse-divider::after {
+        content: ""; flex: 1; height: 1px; background: rgba(14,165,233,0.18);
+      }
+
+      /* ---------------- Coin detail + compare ---------------- */
+      .coin-detail-head { margin-bottom: 14px; }
+      .coin-detail-head h3 { margin: 0; font-size: 17px; }
+      .coin-detail-rows { display: flex; flex-direction: column; margin-bottom: 14px; }
+      .coin-detail-row {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 9px 0; border-bottom: 1px solid rgba(14,165,233,0.12);
+      }
+      .coin-detail-row:last-child { border-bottom: none; }
+      .coin-detail-value { font-weight: 700; font-size: 13.5px; }
+      .coin-detail-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .coin-detail-actions .pill-btn { flex: 1; text-align: center; }
+      .compare-modal { max-width: 560px; }
+      .compare-table-wrap { overflow-x: auto; margin-bottom: 12px; }
+      .compare-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .compare-table th, .compare-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid rgba(14,165,233,0.12); white-space: nowrap; }
+      .compare-table thead th { border-bottom: 2px solid rgba(14,165,233,0.2); vertical-align: top; }
+      .compare-head { display: flex; align-items: center; gap: 6px; }
+      .compare-name { font-size: 11.5px; font-weight: 600; opacity: 0.7; margin-top: 4px; }
+
+      /* ---------------- Buy modal: quick amounts + coin offers ---------------- */
+      .quick-amounts { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 10px; }
+      .offer-units-row { display: flex; gap: 8px; align-items: center; }
+      .offer-units-row .text-input { flex: 1; }
+      select.text-input { appearance: auto; }
 
       .social-sync-row { display: flex; flex-direction: column; gap: 4px; }
       .social-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
