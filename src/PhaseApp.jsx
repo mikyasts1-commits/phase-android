@@ -679,7 +679,7 @@ function getPhiReply(rawText) {
   }
   if (has("invest", "buy", "purchase", "allocat")) {
     return {
-      text: "The Marketplace is the live directory of every listed person, business, and asset. Pick one, choose your currency \u2014 cash, stablecoin, or crypto \u2014 and invest. In this alpha everything is simulated, so explore freely.",
+      text: "The Marketplace is the live directory of every listed person, business, and asset. Pick one, choose your currency \u2014 cash, stablecoin, or crypto \u2014 and invest. Trades settle live on each coin's own Phase chain; balances are test funds while real-money rails are being connected.",
       actions: [{ label: "Open Marketplace", tab: "market" }],
       suggestions: ["How do I go live?", "Is this real money?"],
     };
@@ -706,13 +706,13 @@ function getPhiReply(rawText) {
   }
   if (has("fee", "cost", "price", "charge", "free", "real money")) {
     return {
-      text: "This alpha is completely free and fully simulated \u2014 no real money moves. When Phase connects live rails, fees and terms will be shown before you confirm anything.",
+      text: "Trading on Phase is free while we launch \u2014 no real money moves yet; balances are test funds. When live rails connect, fees and terms will be shown before you confirm anything.",
       suggestions: ["How do I go live?", "How does investing work?"],
     };
   }
   if (has("wallet", "fund", "usdc", "circle", "deposit", "crypto")) {
     return {
-      text: "Funding in the alpha is simulated \u2014 you can add test balances from the Dashboard. Live USDC funding on testnet is being wired on the backend; it'll plug in here when ready.",
+      text: "You can add test balances from the Dashboard to try everything end to end. Card funding runs in test mode and crypto funding is being wired up \u2014 no real money moves yet.",
       actions: [{ label: "Open Dashboard", tab: "dashboard" }],
       suggestions: ["Is this real money?"],
     };
@@ -1350,6 +1350,18 @@ function Icon({ name, size = 18 }) {
           <path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       );
+    case "chevronDown":
+      return (
+        <svg {...common}>
+          <path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    case "chevronUp":
+      return (
+        <svg {...common}>
+          <path d="M6 15l6-6 6 6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
     case "lock":
       return (
         <svg {...common}>
@@ -1384,8 +1396,13 @@ function Icon({ name, size = 18 }) {
 export default function App() {
   const [activeTab, setActiveTab] = useState("golive"); // golive | market | dashboard
   const isAndroid = useMemo(() => /Android/.test(navigator.userAgent || ""), []);
+  const [showSplash, setShowSplash] = useState(true);
+  // Welcoming splash: Phase mark on open, fades away quickly.
+  useEffect(() => {
+    const t = setTimeout(() => setShowSplash(false), 1400);
+    return () => clearTimeout(t);
+  }, []);
   const [showNews, setShowNews] = useState(false);
-  const [showBonusModal, setShowBonusModal] = useState(true);
   const [updateInfo, setUpdateInfo] = useState(null); // GitHub release update offer
   const [phaseCoins, setPhaseCoins] = useState(0);
   const [currency, setCurrency] = useState("usd");
@@ -1571,12 +1588,6 @@ export default function App() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [Math.round(netWorthUsd * 100)]);
-
-  const claimBonus = () => {
-    setPhaseCoins(1000);
-    setShowBonusModal(false);
-    showToast("1,000 PHASE Coins added to your wallet");
-  };
 
   const publishAsset = async (form) => {
     const initialPrice = Math.max(0.01, parseFloat(form.startingPrice) || 10);
@@ -1864,10 +1875,11 @@ export default function App() {
       <GlobalStyles />
       <BackgroundGrid />
 
+      {showSplash && <SplashScreen />}
+
       <TopNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        phaseCoins={phaseCoins}
       />
 
       <main className="app-main">
@@ -1947,7 +1959,6 @@ export default function App() {
 
       {showNews && <NewsDrawer onClose={() => setShowNews(false)} />}
 
-      {showBonusModal && <BonusModal onClaim={claimBonus} />}
 
       {updateInfo && (
         <UpdateDialog
@@ -1985,7 +1996,20 @@ function BackgroundGrid() {
 
 /* -------------------------------- Top Nav ---------------------------------- */
 
-function TopNav({ activeTab, setActiveTab, phaseCoins }) {
+/* ------------------------------ Splash ------------------------------------- */
+
+function SplashScreen() {
+  return (
+    <div className="splash-overlay" aria-hidden="true">
+      <div className="splash-mark">
+        <PhiMark size={84} animated />
+        <div className="splash-word">Phase</div>
+      </div>
+    </div>
+  );
+}
+
+function TopNav({ activeTab, setActiveTab }) {
   const tabs = [
     { id: "golive", label: "Go Live", icon: "directory" },
     { id: "dashboard", label: "Dashboard", icon: "dashboard" },
@@ -2008,12 +2032,7 @@ function TopNav({ activeTab, setActiveTab, phaseCoins }) {
           </button>
         ))}
       </nav>
-      <div className="top-nav-right">
-        <div className="phase-coin-pill" title="Your PHASE Coin balance">
-          <Icon name="coin" size={15} />
-          <span>{phaseCoins.toLocaleString()}</span>
-        </div>
-      </div>
+      <div className="top-nav-right" />
     </header>
   );
 }
@@ -2053,62 +2072,6 @@ function NewsDrawer({ onClose }) {
     </div>
   );
 }
-
-/* ------------------------------- Bonus Modal -------------------------------- */
-
-function BonusModal({ onClaim }) {
-  return (
-    <div className="modal-overlay">
-      <div className="modal-card bonus-modal">
-        <ConfettiBurst />
-        <PhiMark size={52} animated />
-        <h2>Welcome to the network</h2>
-        <p>
-          You've been detected entering the space. Claim your starting balance and explore
-          what's live, or publish your own value-add to the network.
-        </p>
-        <button className="btn-primary btn-large" onClick={onClaim}>
-          <Icon name="coin" size={18} />
-          Claim 1,000 Phase Coins
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function ConfettiBurst() {
-  const pieces = useMemo(
-    () =>
-      Array.from({ length: 24 }, (_, i) => ({
-        id: i,
-        left: Math.random() * 100,
-        delay: Math.random() * 0.4,
-        duration: 1.6 + Math.random() * 1,
-        color: ["#0ea5e9", "#8b5cf6", "#22c55e", "#14b8a6"][i % 4],
-        rotate: Math.random() * 360,
-      })),
-    []
-  );
-  return (
-    <div className="confetti-wrap" aria-hidden="true">
-      {pieces.map((p) => (
-        <span
-          key={p.id}
-          className="confetti-piece"
-          style={{
-            left: `${p.left}%`,
-            animationDelay: `${p.delay}s`,
-            animationDuration: `${p.duration}s`,
-            background: p.color,
-            transform: `rotate(${p.rotate}deg)`,
-          }}
-        />
-      ))}
-    </div>
-  );
-}
-
-/* =============================== GO LIVE TAB ================================ */
 
 function GoLiveTab({ onPublish, issuerAddress }) {
   const [flowStep, setFlowStep] = useState("entry"); // entry | describe | bringYourOwn | form | issuance
@@ -2279,7 +2242,7 @@ function GoLiveTab({ onPublish, issuerAddress }) {
         }}
         issuerAddress={issuerAddress}
         onBack={() => setFlowStep("form")}
-        onComplete={async (mintedCoin, isMeme, sigInfo = {}) => {
+        onComplete={async (mintedCoin, isMeme) => {
           // Hand the real minted coin to the parent for dashboard unlock.
           setHasIssuedCoin(true);
           const asset = await onPublish({
@@ -2290,15 +2253,9 @@ function GoLiveTab({ onPublish, issuerAddress }) {
             socialProfiles,
             verification: { status: "unverified", lookupFollowers: null, lookupEngagement: null },
             compliance: {
-              docFileName: isMeme ? null : "Phase Coin Minting Agreement (signed)",
+              docFileName: isMeme ? null : "Issuer Agreement (digitally signed)",
               generatedAgreement: null,
-              signature: isMeme ? null : {
-                signatureId: sigInfo.signatureId || null,
-                legalName: sigInfo.legalName || "",
-                signedAt: sigInfo.signedAt || null,
-                issuerCategory: sigInfo.issuerCategory || "individual",
-                entityTitle: sigInfo.entityTitle || "",
-              },
+              signature: null,
               issuanceCoinId: mintedCoin.id,
               mintAddress: mintedCoin.mintAddress,
               txSignature: mintedCoin.txSignature,
@@ -2740,14 +2697,14 @@ function GoLiveTab({ onPublish, issuerAddress }) {
 // provisions — steps light up in sequence, ending with the chain ID
 // animating in large. This is the emotional high point of Go Live, so it
 // gets its own beat instead of a generic spinner.
+
 /* ------------------------- Real issuance flow ------------------------- */
 // Draft → choice (Issuer Agreement vs Meme Coin) → sign → mint on your own
 // Phase sovereign chain (in-house — each coin gets its own isolated chain).
 // Uses the real Phase backend. The agreement creates a covenant between the
 // issuer and purchasers; the meme path explicitly mints with no agreement.
 function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
-  const [step, setStep] = useState("choice"); // choice | social | agreement | meme | minting | done | error
-  const [chosenPath, setChosenPath] = useState(null); // "agreement" | "meme"
+  const [step, setStep] = useState("choice"); // choice | social | meme | minting | done | error
   const [socialProviders, setSocialProviders] = useState([]);
   const [socialConns, setSocialConns] = useState([]);
   const [socialLoading, setSocialLoading] = useState(false);
@@ -2765,6 +2722,18 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const idempotencyKey = useRef(`app-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  const draftStarted = useRef(false);
+
+  // The agreement screen needs a backend draft before anything can be signed.
+  // Create it on mount (guarded — the old path left draftId null until a
+  // choice button that no longer exists was pressed, causing
+  // "Body must include draftId." on sign).
+  useEffect(() => {
+    if (draftStarted.current) return;
+    draftStarted.current = true;
+    startDraft();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // The sovereign chain needs the issuer's ph1 wallet address. Prefer the
   // prop; fall back to restoring the on-device wallet from localStorage.
@@ -2820,18 +2789,9 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
     }
   };
 
-  const chooseAgreement = async () => {
-    const id = draftId || (await startDraft());
-    if (!id) return;
-    setChosenPath("agreement");
-    setStep("social");
-    loadSocial();
-  };
-
   const chooseMeme = async () => {
     const id = draftId || (await startDraft());
     if (!id) return;
-    setChosenPath("meme");
     setStep("social");
     loadSocial();
   };
@@ -2882,11 +2842,7 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
   };
 
   const continueFromSocial = async () => {
-    if (chosenPath === "agreement") {
-      setStep("choice");
-    } else {
-      setStep("meme");
-    }
+    setStep("meme");
   };
 
   const signAndMint = async () => {
@@ -2895,14 +2851,16 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
     setBusy(true);
     setError(null);
     try {
-      const sig = await issuanceApi.signAgreement(draftId, legalName.trim(), {
+      const id = draftId || (await startDraft());
+      if (!id) return;
+      const sig = await issuanceApi.signAgreement(id, legalName.trim(), {
         issuerCategory,
         title: issuerCategory === "entity" ? entityTitle.trim() : "",
       });
       setSignatureId(sig.signatureId || null);
       setSignedAt(sig.signedAt || null);
       setStep("minting");
-      const result = await issuanceApi.mint(draftId, {
+      const result = await issuanceApi.mint(id, {
         meme: false,
         idempotencyKey: idempotencyKey.current,
         issuerAddress: await ensureIssuerAddress(),
@@ -2930,8 +2888,10 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
     setBusy(true);
     setError(null);
     try {
+      const id = draftId || (await startDraft());
+      if (!id) return;
       setStep("minting");
-      const result = await issuanceApi.mint(draftId, {
+      const result = await issuanceApi.mint(id, {
         meme: true,
         idempotencyKey: idempotencyKey.current,
         issuerAddress: await ensureIssuerAddress(),
@@ -2950,6 +2910,7 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
 
   if (step === "choice") {
     const canSign =
+      !!draftId &&
       legalName.trim().length >= 2 &&
       accepted &&
       (issuerCategory !== "entity" || entityTitle.trim().length >= 2) &&
@@ -3334,34 +3295,6 @@ function TermsModal({ onClose }) {
   );
 }
 
-function GeneratedAgreementModal({ text, onClose }) {
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-card terms-modal" onClick={(e) => e.stopPropagation()}>
-        <button className="icon-btn modal-close" onClick={onClose}>
-          <Icon name="close" size={18} />
-        </button>
-        <h3>Your Generated Agreement</h3>
-        <div className="terms-body agreement-body">
-          {text.split("\n\n").map((para, i) => (
-            <p key={i}>{para}</p>
-          ))}
-        </div>
-        <a
-          className="btn-secondary btn-full agreement-pdf-link"
-          href="docs/phase-issuer-agreement.pdf"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Icon name="soft" size={15} /> Open the Issuer Agreement (PDF)
-        </a>
-        <button className="btn-primary btn-full" onClick={onClose}>
-          Close
-        </button>
-      </div>
-    </div>
-  );
-}
 
 function GoLivePathPicker({ choosePath, onBringYourOwn }) {
   return (
@@ -4341,6 +4274,9 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
   const [detailCoin, setDetailCoin] = useState(null);
   const [compareIds, setCompareIds] = useState([]); // chainIds, max 3
   const [compareOpen, setCompareOpen] = useState(false);
+  // Category browsing lives behind "Other assets" at the bottom of the page —
+  // the marketplace opens as a search-first issuer directory, not a list.
+  const [showOtherAssets, setShowOtherAssets] = useState(false);
 
   const refreshDirectory = useCallback(async () => {
     setDirLoading(true);
@@ -4460,11 +4396,12 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
         aria-hidden={MARKETPLACE_LOCKED ? true : undefined}
       >
       <div className="market-header">
-        <h2 className="section-title">The Live Directory</h2>
+        <h2 className="section-title">Marketplace</h2>
         <CurrencyDropdown currency={currency} setCurrency={setCurrency} />
       </div>
 
-      {/* Issuer search — every Phase issuer that is live, own + others. */}
+      {/* Issuer search — every person who minted a coin on Phase, searchable.
+          No list until you search: the directory is a search function. */}
       <div className="dir-section">
         <div className="dir-search-row">
           <div className="dir-search-wrap">
@@ -4511,6 +4448,16 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
             <p>{dirError}</p>
             <button className="pill-btn" onClick={refreshDirectory}>Retry</button>
           </div>
+        ) : dirQuery.trim() === "" && dirFilter === "all" ? (
+          <div className="glass-card dir-search-prompt">
+            <Icon name="search" size={28} />
+            <h3>Search every issuer on Phase</h3>
+            <p>
+              {dirCoins.length > 0
+                ? `${dirCoins.length} coin${dirCoins.length === 1 ? "" : "s"} live — type a coin, ticker, or issuer name to find them.`
+                : "No coins have been issued yet — be the first from Go Live."}
+            </p>
+          </div>
         ) : dirFiltered.length === 0 ? (
           <div className="glass-card empty-state">
             <Icon name="directory" size={32} />
@@ -4537,12 +4484,20 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
         )}
       </div>
 
-      {/* The wider category marketplace, one level below the issuer search. */}
+      {/* Other assets: category browsing, behind a tap at the bottom. */}
       <div className="market-browse-divider">
-        <span>Browse the wider marketplace</span>
+        <button
+          className="other-assets-toggle"
+          onClick={() => setShowOtherAssets((v) => !v)}
+          aria-expanded={showOtherAssets}
+        >
+          <span>Other assets</span>
+          <Icon name={showOtherAssets ? "chevronUp" : "chevronDown"} size={15} />
+        </button>
       </div>
 
-      {categoryFilter === "all" ? (
+      {showOtherAssets && (
+      categoryFilter === "all" ? (
         marketEntry === "select" ? (
           <MarketEntrySelect
             counts={countsByCategory}
@@ -4608,6 +4563,7 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
             </div>
           )}
         </>
+      )
       )}
 
       {activeAsset && (
@@ -6002,6 +5958,19 @@ function GlobalStyles() {
         100% { stroke-dashoffset: 0; }
       }
 
+      /* ---------------- Splash ---------------- */
+      .splash-overlay {
+        position: fixed; inset: 0; z-index: 200;
+        display: flex; align-items: center; justify-content: center;
+        background: linear-gradient(160deg, #eef4fb 0%, #e6f0fa 55%, #efe9fb 100%);
+        animation: splashOut 0.45s ease 0.95s forwards;
+        pointer-events: none;
+      }
+      .splash-mark { display: flex; flex-direction: column; align-items: center; gap: 14px; animation: splashIn 0.5s ease both; }
+      .splash-word { font-size: 30px; font-weight: 700; color: var(--navy); letter-spacing: 0.5px; }
+      @keyframes splashIn { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }
+      @keyframes splashOut { to { opacity: 0; visibility: hidden; } }
+
       /* ---------------- Top nav ---------------- */
       .top-nav {
         position: sticky;
@@ -6037,13 +6006,6 @@ function GlobalStyles() {
       .nav-tab:hover { opacity: 0.85; }
       .nav-tab-active { background: white; opacity: 1; box-shadow: 0 2px 10px rgba(14,165,233,0.18); }
       .top-nav-right { display: flex; align-items: center; }
-      .phase-coin-pill {
-        display: flex; align-items: center; gap: 6px;
-        background: linear-gradient(135deg, rgba(14,165,233,0.12), rgba(139,92,246,0.12));
-        border: 1px solid rgba(14,165,233,0.22);
-        padding: 6px 12px; border-radius: 20px;
-        font-family: 'IBM Plex Mono'; font-size: 12.5px; color: var(--navy); font-weight: 500;
-      }
 
       @media (max-width: 760px) {
         .top-nav { flex-wrap: wrap; }
@@ -6202,6 +6164,15 @@ function GlobalStyles() {
       .market-browse-divider::before, .market-browse-divider::after {
         content: ""; flex: 1; height: 1px; background: rgba(14,165,233,0.18);
       }
+      .other-assets-toggle {
+        display: flex; align-items: center; gap: 8px;
+        background: none; border: none; cursor: pointer; padding: 4px 8px;
+        color: rgba(30,58,95,0.75); font-family: 'Outfit'; font-size: 12.5px; font-weight: 600;
+        text-transform: uppercase; letter-spacing: 0.06em;
+      }
+      .dir-search-prompt { text-align: center; padding: 28px 20px; }
+      .dir-search-prompt h3 { margin: 12px 0 6px; font-size: 16px; }
+      .dir-search-prompt p { font-size: 13px; opacity: 0.65; line-height: 1.5; margin: 0; }
 
       /* ---------------- Coin detail + compare ---------------- */
       .coin-detail-head { margin-bottom: 14px; }
@@ -6366,7 +6337,6 @@ function GlobalStyles() {
 
       .generate-agreement-block { background: rgba(139,92,246,0.05); border-radius: 14px; padding: 14px; margin-top: 6px; }
       .signature-input { font-family: 'Outfit'; font-style: italic; }
-      .agreement-body { font-family: 'IBM Plex Mono'; font-size: 11.5px; }
 
       .split-slider-block { background: rgba(14,165,233,0.05); border-radius: 14px; padding: 14px; margin-top: 4px; }
       .split-slider-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
@@ -6555,7 +6525,6 @@ function GlobalStyles() {
       }
       .agreement-preview-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin: 6px 0 4px; }
       .agreement-pdf-inline { display: inline-flex; align-items: center; gap: 5px; text-decoration: underline; }
-      .agreement-pdf-link { display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 10px; text-decoration: none; }
 
       .terms-modal { max-width: 480px; }
       .terms-modal h3 { margin: 0 0 14px; font-size: 18px; }
@@ -7108,19 +7077,6 @@ function GlobalStyles() {
       }
       @keyframes modalPop { from { transform: scale(0.92) translateY(10px); opacity: 0; } to { transform: scale(1) translateY(0); opacity: 1; } }
       .modal-close { position: absolute; top: 16px; right: 16px; }
-
-      .bonus-modal { text-align: center; overflow: hidden; }
-      .bonus-modal h2 { margin: 16px 0 8px; font-size: 21px; }
-      .bonus-modal p { font-size: 13.5px; opacity: 0.7; line-height: 1.55; margin: 0 0 6px; }
-
-      .confetti-wrap { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
-      .confetti-piece {
-        position: absolute; top: -10px; width: 7px; height: 12px; opacity: 0.8;
-        animation: confettiFall linear forwards;
-      }
-      @keyframes confettiFall {
-        to { transform: translateY(420px) rotate(540deg); opacity: 0; }
-      }
 
       .invest-modal h3 { margin: 0 0 4px; font-size: 18px; }
       .invest-price-row { display: flex; justify-content: space-between; align-items: center; background: rgba(14,165,233,0.06); border-radius: 12px; padding: 10px 14px; margin: 14px 0; }
