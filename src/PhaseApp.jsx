@@ -50,14 +50,27 @@ const issuanceApi = {
   createDraft: (draft) => backendFetch("/issuance/draft", { method: "POST", body: draft }),
   getAgreement: (draftId) =>
     backendFetch(`/issuance/agreement?draftId=${encodeURIComponent(draftId)}`),
-  signAgreement: (draftId, legalName) =>
-    backendFetch("/issuance/sign", { method: "POST", body: { draftId, legalName, accepted: true, userId: PHASE_USER_ID } }),
+  signAgreement: (draftId, legalName, { issuerCategory = "individual", title = "" } = {}) =>
+    backendFetch("/issuance/sign", {
+      method: "POST",
+      body: { draftId, legalName, accepted: true, userId: PHASE_USER_ID, issuerCategory, title },
+    }),
   mint: (draftId, { meme = false, idempotencyKey, issuerAddress, totalShares } = {}) =>
     backendFetch("/issuance/mint", {
       method: "POST",
       body: { draftId, meme, userId: PHASE_USER_ID, issuerAddress, totalShares },
       idempotencyKey: idempotencyKey || `mint-${draftId}-${Date.now()}`,
     }),
+};
+
+// Legal documents: the completed Phase Coin Minting Agreement.
+const legalApi = {
+  // The full completed agreement — linked from the Sign & Mint page.
+  agreementUrl: () => `${PHASE_BACKEND_URL}/legal/minting-agreement.pdf`,
+  // The issuer's own signed copy (Article 20 auto-populated) — shown in
+  // Documentation & Compliance after issuance.
+  signedAgreementUrl: (signatureId) =>
+    `${PHASE_BACKEND_URL}/legal/minting-agreement/signed/${encodeURIComponent(signatureId)}.pdf`,
 };
 
 // Marketplace settlement: real two-legged trades for sovereign coins.
@@ -642,7 +655,7 @@ function getPhiReply(rawText) {
   }
   if (has("agreement", "contract", "legal", "sign", "signature")) {
     return {
-      text: "The Issuer Agreement is the contract you sign when you go live \u2014 a commitment to everyone who buys your coin covering who you are, the accuracy of your statements, and how value is shared. You can preview the PDF in the signing step. It's a template for now; legal counsel reviews it before any real offering.",
+      text: "The Issuer Agreement is the Phase Coin Minting Agreement you sign when you go live \u2014 a commitment to everyone who buys your coin covering who you are, the accuracy of your statements, and how value is shared. You can open the full PDF in the signing step, and your signed copy lands in Documentation & Compliance.",
       suggestions: ["How do I go live?", "How does investing work?"],
     };
   }
@@ -2169,7 +2182,7 @@ function GoLiveTab({ onPublish, issuerAddress }) {
         }}
         issuerAddress={issuerAddress}
         onBack={() => setFlowStep("form")}
-        onComplete={async (mintedCoin, isMeme) => {
+        onComplete={async (mintedCoin, isMeme, sigInfo = {}) => {
           // Hand the real minted coin to the parent for dashboard unlock.
           setHasIssuedCoin(true);
           const asset = await onPublish({
@@ -2180,9 +2193,15 @@ function GoLiveTab({ onPublish, issuerAddress }) {
             socialProfiles,
             verification: { status: "unverified", lookupFollowers: null, lookupEngagement: null },
             compliance: {
-              docFileName: isMeme ? null : "Issuer Agreement (digitally signed)",
+              docFileName: isMeme ? null : "Phase Coin Minting Agreement (signed)",
               generatedAgreement: null,
-              signature: null,
+              signature: isMeme ? null : {
+                signatureId: sigInfo.signatureId || null,
+                legalName: sigInfo.legalName || "",
+                signedAt: sigInfo.signedAt || null,
+                issuerCategory: sigInfo.issuerCategory || "individual",
+                entityTitle: sigInfo.entityTitle || "",
+              },
               issuanceCoinId: mintedCoin.id,
               mintAddress: mintedCoin.mintAddress,
               txSignature: mintedCoin.txSignature,
@@ -2639,6 +2658,10 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
   const [agreementText, setAgreementText] = useState("");
   const [agreementHash, setAgreementHash] = useState("");
   const [legalName, setLegalName] = useState("");
+  const [issuerCategory, setIssuerCategory] = useState("individual"); // individual | entity
+  const [entityTitle, setEntityTitle] = useState("");
+  const [signatureId, setSignatureId] = useState(null);
+  const [signedAt, setSignedAt] = useState(null);
   const [accepted, setAccepted] = useState(false);
   const [memeConfirmed, setMemeConfirmed] = useState(false);
   const [mintResult, setMintResult] = useState(null);
@@ -2771,10 +2794,16 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
 
   const signAndMint = async () => {
     if (!legalName.trim() || legalName.trim().length < 2 || !accepted) return;
+    if (issuerCategory === "entity" && !entityTitle.trim()) return;
     setBusy(true);
     setError(null);
     try {
-      await issuanceApi.signAgreement(draftId, legalName.trim());
+      const sig = await issuanceApi.signAgreement(draftId, legalName.trim(), {
+        issuerCategory,
+        title: issuerCategory === "entity" ? entityTitle.trim() : "",
+      });
+      setSignatureId(sig.signatureId || null);
+      setSignedAt(sig.signedAt || null);
       setStep("minting");
       const result = await issuanceApi.mint(draftId, {
         meme: false,
@@ -2784,7 +2813,13 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
       });
       setMintResult(result.coin);
       setStep("done");
-      onComplete && onComplete(result.coin, false);
+      onComplete && onComplete(result.coin, false, {
+        signatureId: sig.signatureId || null,
+        signedAt: sig.signedAt || null,
+        legalName: legalName.trim(),
+        issuerCategory,
+        entityTitle: issuerCategory === "entity" ? entityTitle.trim() : "",
+      });
     } catch (e) {
       setError(e.message);
       setStep("error");
@@ -2817,7 +2852,11 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
   };
 
   if (step === "choice") {
-    const canSign = legalName.trim().length >= 2 && accepted && !busy;
+    const canSign =
+      legalName.trim().length >= 2 &&
+      accepted &&
+      (issuerCategory !== "entity" || entityTitle.trim().length >= 2) &&
+      !busy;
     return (
       <div className="issuance-flow">
         <button className="link-btn back-link" onClick={onBack}>
@@ -2837,6 +2876,45 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
         {agreementHash && (
           <p className="field-hint">Document hash: {agreementHash.slice(0, 16)}…</p>
         )}
+        <button
+          className="btn btn-secondary btn-full"
+          type="button"
+          onClick={() => window.open(legalApi.agreementUrl(), "_blank", "noopener")}
+          disabled={busy}
+        >
+          View full terms and conditions (PDF)
+        </button>
+        <p className="field-hint">
+          The complete Phase Coin Minting Agreement — the binding document your signature applies to.
+        </p>
+        <label className="field-label" htmlFor="issuance-issuer-category">
+          Issuer category
+        </label>
+        <select
+          id="issuance-issuer-category"
+          className="text-input"
+          value={issuerCategory}
+          onChange={(e) => setIssuerCategory(e.target.value)}
+          disabled={busy}
+        >
+          <option value="individual">Individual (Schedule A)</option>
+          <option value="entity">Entity — company, fund, or organization (Schedule B)</option>
+        </select>
+        {issuerCategory === "entity" && (
+          <>
+            <label className="field-label" htmlFor="issuance-entity-title">
+              Your title at the entity
+            </label>
+            <input
+              id="issuance-entity-title"
+              className="text-input"
+              placeholder="e.g. Chief Executive Officer"
+              value={entityTitle}
+              onChange={(e) => setEntityTitle(e.target.value)}
+              disabled={busy}
+            />
+          </>
+        )}
         <label className="field-label" htmlFor="issuance-legal-name">
           Your full legal name
         </label>
@@ -2854,8 +2932,8 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
             onChange={(e) => setAccepted(e.target.checked)}
           />
           <span>
-            I, {legalName || "[your name]"}, have read this Issuer Agreement and agree to be
-            bound by its covenants to each purchaser of {coin.ticker}.
+            I, {legalName || "[your name]"}, have read the Phase Coin Minting Agreement
+            (full terms) and agree to be bound by its covenants to each purchaser of {coin.ticker}.
           </span>
         </label>
         <button
@@ -3058,7 +3136,7 @@ function IssuanceDoneScreen({ mintResult, coin, socialConns, onBack }) {
       <p className="section-sub">
         {mintResult.isMeme
           ? "Minted as a meme coin — no agreement attached."
-          : "Issuer Agreement signed and recorded."}
+          : "Minting Agreement signed — your signed copy is in Documentation & Compliance."}
       </p>
       <div className="mint-details">
         <div className="mint-detail-row">
@@ -5001,19 +5079,40 @@ function DashboardTab({
               </div>
             </div>
             <div className="compliance-doc-list">
-              {ownedProducts.map((a) => (
-                <div className="compliance-doc-row" key={a.id}>
-                  <span className="compliance-doc-name">{a.name}</span>
-                  <span className={`badge ${a.compliance && a.compliance.consented ? "badge-compliant" : "badge-pending"}`}>
-                    <Icon name={a.compliance && a.compliance.consented ? "check" : "close"} size={11} />
-                    {a.compliance && a.compliance.consented ? "On File" : "Missing"}
-                  </span>
-                  <span className={`badge ${a.verification && a.verification.status === "verified" ? "badge-verified" : "badge-pending"}`}>
-                    <Icon name={a.verification && a.verification.status === "verified" ? "check" : "close"} size={11} />
-                    {a.verification && a.verification.status === "verified" ? "Verified" : "Unverified"}
-                  </span>
-                </div>
-              ))}
+              {ownedProducts.map((a) => {
+                const sig = a.compliance && a.compliance.signature;
+                return (
+                  <div className="compliance-doc-entry" key={a.id}>
+                    <div className="compliance-doc-row">
+                      <span className="compliance-doc-name">{a.name}</span>
+                      <span className={`badge ${a.compliance && a.compliance.consented ? "badge-compliant" : "badge-pending"}`}>
+                        <Icon name={a.compliance && a.compliance.consented ? "check" : "close"} size={11} />
+                        {a.compliance && a.compliance.consented ? "On File" : "Missing"}
+                      </span>
+                      <span className={`badge ${a.verification && a.verification.status === "verified" ? "badge-verified" : "badge-pending"}`}>
+                        <Icon name={a.verification && a.verification.status === "verified" ? "check" : "close"} size={11} />
+                        {a.verification && a.verification.status === "verified" ? "Verified" : "Unverified"}
+                      </span>
+                    </div>
+                    {sig && sig.signatureId && (
+                      <div className="compliance-signed-doc">
+                        <span className="compliance-signed-meta">
+                          Phase Coin Minting Agreement — signed by {sig.legalName}
+                          {sig.signedAt ? ` on ${new Date(sig.signedAt).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}` : ""}
+                          {sig.issuerCategory === "entity" ? " (Entity)" : " (Individual)"}
+                        </span>
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          type="button"
+                          onClick={() => window.open(legalApi.signedAgreementUrl(sig.signatureId), "_blank", "noopener")}
+                        >
+                          View signed agreement
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </>
         )}
@@ -6201,6 +6300,9 @@ function GlobalStyles() {
       .compliance-summary-row { display: flex; gap: 28px; flex-wrap: wrap; margin-bottom: 14px; }
       .compliance-summary-stat { display: flex; flex-direction: column; gap: 2px; }
       .compliance-doc-list { display: flex; flex-direction: column; gap: 8px; }
+      .compliance-doc-entry { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 12px; background: rgba(59,130,246,0.06); border: 1px solid rgba(59,130,246,0.12); }
+      .compliance-signed-doc { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+      .compliance-signed-meta { font-size: 12.5px; color: var(--ink-soft); line-height: 1.45; }
       .compliance-doc-row {
         display: flex; align-items: center; gap: 10px; padding: 8px 0;
         border-bottom: 1px solid rgba(14,165,233,0.06); font-size: 12.5px;
