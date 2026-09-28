@@ -70,7 +70,7 @@ const legalApi = {
   // The issuer's own signed copy (Article 20 auto-populated) — shown in
   // Documentation & Compliance after issuance.
   signedAgreementUrl: (signatureId) =>
-    `${PHASE_BACKEND_URL}/legal/minting-agreement/signed/${encodeURIComponent(signatureId)}.pdf`,
+    `${PHASE_BACKEND_URL}/legal/minting-agreement/signed/${encodeURIComponent(signatureId)}`,
 };
 
 // Marketplace settlement: real two-legged trades for sovereign coins.
