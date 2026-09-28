@@ -8,6 +8,25 @@ import { mountCardElement, confirmCardPayment } from "./stripe-client.js";
 // Real backend: issuance (draft → agreement → sign → mint) and funding.
 const PHASE_BACKEND_URL = "https://phase-backend.onrender.com/api/v1";
 
+// Per-install identity: a stable random ID per device install, persisted in
+// localStorage. Replaces the old hardcoded "app-user" so buyer and issuer
+// are distinct accounts across devices (and self-trade is correctly
+// rejected). This is NOT a login — real authenticated identity still to come.
+function phaseUserId() {
+  const K = "phase_user_id";
+  try {
+    let id = localStorage.getItem(K);
+    if (!id) {
+      id = "u_" + (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
+      localStorage.setItem(K, id);
+    }
+    return id;
+  } catch {
+    return "u_" + Math.random().toString(36).slice(2);
+  }
+}
+const PHASE_USER_ID = phaseUserId();
+
 async function backendFetch(path, { method = "GET", body, idempotencyKey } = {}) {
   const headers = { "Content-Type": "application/json" };
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
@@ -32,11 +51,11 @@ const issuanceApi = {
   getAgreement: (draftId) =>
     backendFetch(`/issuance/agreement?draftId=${encodeURIComponent(draftId)}`),
   signAgreement: (draftId, legalName) =>
-    backendFetch("/issuance/sign", { method: "POST", body: { draftId, legalName, accepted: true, userId: "app-user" } }),
+    backendFetch("/issuance/sign", { method: "POST", body: { draftId, legalName, accepted: true, userId: PHASE_USER_ID } }),
   mint: (draftId, { meme = false, idempotencyKey, issuerAddress, totalShares } = {}) =>
     backendFetch("/issuance/mint", {
       method: "POST",
-      body: { draftId, meme, userId: "app-user", issuerAddress, totalShares },
+      body: { draftId, meme, userId: PHASE_USER_ID, issuerAddress, totalShares },
       idempotencyKey: idempotencyKey || `mint-${draftId}-${Date.now()}`,
     }),
 };
@@ -47,13 +66,13 @@ const tradeApi = {
   buy: (chainId, { amountUsd, buyerAddress, idempotencyKey } = {}) =>
     backendFetch("/trades/buy", {
       method: "POST",
-      body: { userId: "app-user", chainId, amountUsd, buyerAddress },
+      body: { userId: PHASE_USER_ID, chainId, amountUsd, buyerAddress },
       idempotencyKey: idempotencyKey || `buy-${chainId}-${Date.now()}`,
     }),
-  balances: () => backendFetch(`/trades/balances?userId=app-user`),
-  history: (role = "seller") => backendFetch(`/trades/history?userId=app-user&role=${role}`),
+  balances: () => backendFetch(`/trades/balances?userId=${PHASE_USER_ID}`),
+  history: (role = "seller") => backendFetch(`/trades/history?userId=${PHASE_USER_ID}&role=${role}`),
   topup: (amountUsd) =>
-    backendFetch("/trades/topup", { method: "POST", body: { userId: "app-user", amountUsd } }),
+    backendFetch("/trades/topup", { method: "POST", body: { userId: PHASE_USER_ID, amountUsd } }),
 };
 
 const socialApi = {  getProviders: () => backendFetch("/social/providers"),
@@ -1384,7 +1403,7 @@ export default function App() {
   // deposits land (or once the user mints their own coin).
   const refreshFundingStatus = useCallback(async () => {
     try {
-      const data = await fundingApi.getBalances("app-user");
+      const data = await fundingApi.getBalances(PHASE_USER_ID);
       const balances = data.balances || data || {};
       const total = Object.values(balances).reduce((sum, b) => {
         const credited = typeof b === "object" ? (b.credited || 0) : b;
@@ -2651,7 +2670,7 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
     setError(null);
     try {
       const draft = await issuanceApi.createDraft({
-        userId: "app-user",
+        userId: PHASE_USER_ID,
         name: coin.name,
         ticker: coin.ticker,
         category: coin.category || "Creator",
@@ -2702,7 +2721,7 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
     try {
       const [prov, conns] = await Promise.all([
         socialApi.getProviders().catch(() => ({ providers: [] })),
-        socialApi.getConnections("app-user").catch(() => ({ connections: [] })),
+        socialApi.getConnections(PHASE_USER_ID).catch(() => ({ connections: [] })),
       ]);
       setSocialProviders(prov.providers || []);
       setSocialConns(conns.connections || []);
@@ -2714,13 +2733,13 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
   const connectSocial = async (provider) => {
     setSocialLoading(true);
     try {
-      const { authorizeUrl } = await socialApi.getAuthorizeUrl(provider, "app-user");
+      const { authorizeUrl } = await socialApi.getAuthorizeUrl(provider, PHASE_USER_ID);
       // Open OAuth in system browser; backend callback stores the connection.
       window.open(authorizeUrl, "_blank");
       // Poll for the new connection (user completes OAuth in browser)
       for (let i = 0; i < 20; i++) {
         await new Promise((r) => setTimeout(r, 3000));
-        const { connections } = await socialApi.getConnections("app-user").catch(() => ({ connections: [] }));
+        const { connections } = await socialApi.getConnections(PHASE_USER_ID).catch(() => ({ connections: [] }));
         if (connections.some((c) => c.provider === provider)) {
           setSocialConns(connections);
           break;
@@ -2735,7 +2754,7 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
 
   const disconnectSocial = async (provider) => {
     try {
-      await socialApi.disconnect(provider, "app-user");
+      await socialApi.disconnect(provider, PHASE_USER_ID);
       setSocialConns(socialConns.filter((c) => c.provider !== provider));
     } catch (e) {
       setError(e.message);
@@ -3020,7 +3039,7 @@ function IssuanceDoneScreen({ mintResult, coin, socialConns, onBack }) {
   const handleAnnounce = async () => {
     setAnnouncing(true);
     try {
-      const res = await socialApi.announce("app-user", coin.name, coin.ticker, !!mintResult.isMeme);
+      const res = await socialApi.announce(PHASE_USER_ID, coin.name, coin.ticker, !!mintResult.isMeme);
       setCardUrl(res.cardUrl);
       setAnnounceResult(res.results);
     } catch (e) {
@@ -3436,7 +3455,7 @@ function CardFundPanel({ onFunded }) {
     setStep("processing");
     setError(null);
     try {
-      const intent = await fundingApi.createStripeIntent("app-user", amountMinor, "cad");
+      const intent = await fundingApi.createStripeIntent(PHASE_USER_ID, amountMinor, "cad");
       if (!intent.client_secret) throw new Error("No client secret from backend.");
       if (!mountedRef.current) return;
       setClientSecret(intent.client_secret);
@@ -3609,16 +3628,16 @@ function FundAccountModal({ onClose, onFund }) {
     try {
       if (isBtcChain) {
         const [addr, bal] = await Promise.all([
-          fundingApi.getBtcAddress("app-user"),
-          fundingApi.getBtcBalance("app-user").catch(() => null),
+          fundingApi.getBtcAddress(PHASE_USER_ID),
+          fundingApi.getBtcBalance(PHASE_USER_ID).catch(() => null),
         ]);
         if (!mountedRef.current) return;
         setDepositInfo({ addresses: { "BTC-TESTNET": addr.address }, defaultChain: "BTC-TESTNET", testnet: addr.testnet });
         setBalances(bal ? { totals: { BTC: { credited: bal.confirmedBtc, pending: bal.mempoolBtc } } } : null);
       } else {
         const [dep, bal] = await Promise.all([
-          fundingApi.getDepositInfo("app-user"),
-          fundingApi.getBalances("app-user").catch(() => null),
+          fundingApi.getDepositInfo(PHASE_USER_ID),
+          fundingApi.getBalances(PHASE_USER_ID).catch(() => null),
         ]);
         if (!mountedRef.current) return;
         setDepositInfo(dep);
@@ -3662,7 +3681,7 @@ function FundAccountModal({ onClose, onFund }) {
     pollRef.current = setInterval(async () => {
       try {
         if (isBtcChain) {
-          const bal = await fundingApi.getBtcBalance("app-user");
+          const bal = await fundingApi.getBtcBalance(PHASE_USER_ID);
           if (!mountedRef.current) return;
           setPollCount((n) => n + 1);
           const credited = parseFloat(bal?.confirmedBtc || "0");
@@ -3675,7 +3694,7 @@ function FundAccountModal({ onClose, onFund }) {
           }
           return;
         }
-        const bal = await fundingApi.getBalances("app-user");
+        const bal = await fundingApi.getBalances(PHASE_USER_ID);
         if (!mountedRef.current) return;
         setBalances(bal);
         setPollCount((n) => n + 1);
