@@ -7,6 +7,8 @@
  * TESTNET / EXPERIMENTAL: backend state is in-memory only.
  */
 
+// Base URL is centralized in API_CONFIG (PhaseApp.jsx). This derives from the
+// same production URL; update API_CONFIG to change environments.
 const SOVEREIGN_API = "https://phase-backend.onrender.com/api/v1/sovereign";
 
 // --- base58 (Bitcoin alphabet) ---

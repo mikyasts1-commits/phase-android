@@ -3,10 +3,19 @@ import { checkForUpdates, dismissUpdate, UpdateDialog } from "./update-check.jsx
 import { MARKETPLACE_LOCKED, CRYPTO_FUNDING_LOCKED, GO_LIVE_LOCKED, DASHBOARD_LOCKED } from "./feature-flags.js";
 import { generateWallet, restoreWallet, createSovereignChain } from "./sovereign-client.js";
 import { mountCardElement, confirmCardPayment } from "./stripe-client.js";
+import { reportError } from "./sentry.js";
 
 /* ------------------------- Phase backend API client ------------------------- */
 // Real backend: issuance (draft → agreement → sign → mint) and funding.
-const PHASE_BACKEND_URL = "https://phase-backend.onrender.com/api/v1";
+//
+// Central API configuration. Production is live; add staging/dev URLs here
+// when those environments exist and switch PHASE_BACKEND_URL below.
+//   staging: "https://phase-backend-staging.onrender.com/api/v1",
+//   dev:     "http://localhost:3000/api/v1",
+const API_CONFIG = {
+  production: "https://phase-backend.onrender.com/api/v1",
+};
+const PHASE_BACKEND_URL = API_CONFIG.production;
 
 // Per-install identity: a stable random ID per device install, persisted in
 // localStorage. Replaces the old hardcoded "app-user" so buyer and issuer
@@ -131,6 +140,8 @@ const authApi = {
     backendFetch("/auth/reset-password", { method: "POST", body: { token, password } }),
   verifyEmail: (token) =>
     backendFetch("/auth/verify-email", { method: "POST", body: { token } }),
+  deleteAccount: (password) =>
+    backendFetch("/auth/account", { method: "DELETE", body: { password } }),
 };
 const issuanceApi = {
   createDraft: (draft) => backendFetch("/issuance/draft", { method: "POST", body: draft }),
@@ -381,15 +392,6 @@ const COMPLIANCE_META = {
 // math stay identical across every chain on the network.
 const SOVEREIGN_TOTAL_SHARES = 1_000_000;
 
-// Simulated PHASE Coin inflow dropped into a chain's own portfolio pool
-// every background cycle, per the "16,000 PHASE Coin Network Inflow
-// Engine" — purely a visual/simulated drip tied to the chain being live,
-// not a real monetary system.
-const PHASE_CHAIN_INFLOW_PER_CYCLE = 16000;
-
-// Per-tick share-price jitter bounds for the sovereign chain price daemon.
-const CHAIN_JITTER_PCT = 0.015;
-
 function generateChainId() {
   // Six-digit sovereign chain identifier, e.g. "Φ-482913"
   return "Φ-" + String(Math.floor(100000 + Math.random() * 900000));
@@ -487,7 +489,37 @@ const FUNDING_METHODS = [
   { id: "crypto", label: "Crypto Wallet Transfer", icon: "stocks", note: "Send USDC or USDT from an external wallet." },
 ];
 
-const ONCHAINING_TERMS = `Phase Sovereign Chain Terms & Consent (Prototype Summary)
+// DRAFT — requires legal review before production.
+// Privacy policy shown in-app (Settings → Privacy Policy) and linked from
+// the signup screen. Contact placeholder must be replaced with the real
+// privacy contact before launch.
+const PRIVACY_POLICY = `Phase Privacy Policy (Draft)
+
+Last updated: September 2026
+
+1. Data we collect.
+Account information: your name, email address, and password (stored as a one-way hash — we never store your plain-text password). Issued assets: the coins, chains, and listings you create, including names, descriptions, images, and social/website links you provide. Transaction history: trades, funding events, and balances associated with your account. Device data: basic technical information needed to operate the app (device type, app version).
+
+2. How we use it.
+We use your data to operate your account, display your dashboard and marketplace activity, process issuance and trades, provide support, and comply with legal obligations. We do not sell your personal data.
+
+3. Data sharing.
+We do not share your personal data with third parties except as required by law (for example, a valid court order or regulatory request) or to operate core infrastructure (hosting, crash reporting). Any such provider only receives the minimum data needed to perform its function.
+
+4. Data retention.
+We keep your account data for as long as your account is active. If you delete your account, we permanently delete your personal data, issued assets, and transaction history, except for records we are legally required to retain (for example, financial records subject to tax or anti-fraud law).
+
+5. Your rights.
+You may request a copy of your data, correct inaccurate data, or delete your account and personal data at any time from Settings → Delete Account. For other requests, contact privacy@phase.app. // TODO: replace with the real privacy contact before production.
+
+6. Security.
+We protect your data with encrypted connections, authenticated API access, and server-side session management. No system is perfectly secure; if we learn of a breach affecting your data, we will notify you as required by law.
+
+7. Changes.
+If we change this policy materially, we will notify you in the app before the changes take effect.
+`;
+
+const ONCHAINING_TERMS = `Phase Sovereign Chain Terms & Consent
 
 1. Accuracy of Information. By provisioning a sovereign chain, you confirm that the description, social proof metrics, and any supporting documentation you provide are accurate to the best of your knowledge.
 
@@ -495,11 +527,11 @@ const ONCHAINING_TERMS = `Phase Sovereign Chain Terms & Consent (Prototype Summa
 
 3. Share Split & Pricing. The public/retained split and starting share price you configure at provisioning are yours to set. 1,000,000 fractional shares are minted at genesis and allocated accordingly.
 
-4. No Guarantee of Value. Share prices reflect simulated market activity in this prototype and are not guaranteed. Phase does not provide investment advice.
+4. No Guarantee of Value. Share prices are not guaranteed and may fluctuate. Phase does not provide investment advice.
 
 5. Revocability. Phase reserves the right to suspend a chain if the underlying information is found to be inaccurate or fraudulent.
 
-This is a condensed prototype summary for demonstration purposes and is not a binding legal agreement.`;
+DRAFT — pending legal review. This summary does not constitute legal advice.`;
 
 // Produces the text of an auto-generated Sovereign Chain Charter using the
 // person's own entered information \u2014 a lightweight, informational record
@@ -525,10 +557,10 @@ Date: ${new Date().toLocaleDateString(undefined, { year: "numeric", month: "long
 
 7. Digital Signature. My typed legal name below constitutes my digital signature on this attestation and binds me to its terms.
 
-TEMPLATE ONLY — This document is generated automatically from information provided. It is a template illustration for demonstration purposes, not a binding legal agreement and not a substitute for independent legal advice. Have legal counsel review before relying on it.`;
+DRAFT — pending legal review. This document is generated automatically from the information provided and is not a substitute for independent legal advice.`;
 function generateAgreementText({ ownerName, listingName, valueThesis, equityPublic, equityRetained, docLabel }) {
   const date = new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
-  return `PHASE ISSUER AGREEMENT \u2014 TEMPLATE
+  return `PHASE ISSUER AGREEMENT
 Generated by Phase Platforms \u2014 ${date}
 
 This Issuer Agreement ("Agreement") is made by the undersigned issuer ("Issuer") for the benefit of each person who purchases shares of the coin described below ("Purchasers").
@@ -545,7 +577,7 @@ This Issuer Agreement ("Agreement") is made by the undersigned issuer ("Issuer")
 
 4. Value Sharing. Issuer intends that any future income, appreciation, royalties, or other economic value generated by the activity or asset described for this Coin will be reflected in the Coin's share price, in proportion to the split in Section 2, for as long as shares remain publicly held.
 
-5. Purchaser Acknowledgments. Each Purchaser acknowledges that: (i) no return is guaranteed and the Coin's value may fall to zero; (ii) the Coin trades on an isolated ledger whose price moves independently of any other chain; (iii) this is a prototype market for demonstration purposes.
+5. Purchaser Acknowledgments. Each Purchaser acknowledges that: (i) no return is guaranteed and the Coin's value may fall to zero; (ii) the Coin trades on an isolated ledger whose price moves independently of any other chain; (iii) the Coin is a novel digital asset with uncertain regulatory treatment.
 
 6. Term. This Agreement remains in effect for as long as any shares of the Coin are publicly held.
 
@@ -553,7 +585,7 @@ This Issuer Agreement ("Agreement") is made by the undersigned issuer ("Issuer")
 
 Signed: ${ownerName || "[Issuer legal name]"} \u2014 ${date}
 
-TEMPLATE ONLY \u2014 This document is generated automatically from information Issuer provided. It is a template illustration for demonstration purposes, not a binding legal agreement and not a substitute for independent legal advice. Have legal counsel review before relying on it.`;
+DRAFT \u2014 pending legal review. This document is generated automatically from information Issuer provided and is not a substitute for independent legal advice.`;
 }
 
 const NEWS_ITEMS = [
@@ -583,146 +615,6 @@ const NEWS_ITEMS = [
     body: "Verified social reach and signed documentation are what separate investment-grade chains from speculative attention \u2014 both protect shareholders and the person going live.",
   },
 ];
-
-// Lightweight seed data for mock marketplace listings, one to two per
-// subsection. These are clearly fictional and exist to make the directory
-// feel populated before a real user publishes anything. hydrateMockAsset()
-// below expands each into the same shape a real published asset uses.
-const MOCK_LISTINGS_SEED = [
-  // Public Stocks (fictional flagship-scale companies mirrored onto Nasdaq's
-  // tokenization rail \u2014 no real public company names are used as
-  // investable products here, but each is written at the scale and
-  // specificity of an actual market leader in its sector)
-  { name: "Veyronix Silicon", ticker: "VYRX.m", category: "stocks", subsection: "Technology", network: "nasdaq", tagline: "The dominant fabless designer of edge-AI inference chips, with a market capitalization near $2.1 trillion and silicon inside most flagship phones and AI PCs sold worldwide.", price: 70.92, prevPrice: 71.05, authorityScore: 94, marketCap: "$2.1T" },
-  { name: "Quorvex Compute", ticker: "QRVX.m", category: "stocks", subsection: "Technology", network: "nasdaq", tagline: "The leading accelerated-computing platform powering large-scale AI training, with a market capitalization near $3.4 trillion across its data center and software segments.", price: 157.82, prevPrice: 157.11, authorityScore: 96, marketCap: "$3.4T" },
-  { name: "Lucenna Therapeutics", ticker: "LUCN.m", category: "stocks", subsection: "Healthcare", network: "nasdaq", tagline: "A top-five global pharmaceutical manufacturer with a market capitalization near $740 billion, anchored by a blockbuster metabolic disease franchise.", price: 23.12, prevPrice: 22.92, authorityScore: 88, marketCap: "$740B" },
-  { name: "Solmark Financial", ticker: "SLMK.m", category: "stocks", subsection: "Financials", network: "nasdaq", tagline: "A bulge-bracket global investment bank with a market capitalization near $310 billion, spanning trading, advisory, and asset management.", price: 51.51, prevPrice: 51.67, authorityScore: 85, marketCap: "$310B" },
-  { name: "Aerodyne Commerce", ticker: "ARDC.m", category: "stocks", subsection: "Consumer Discretionary", network: "nasdaq", tagline: "The largest e-commerce and logistics retailer in its region, with a market capitalization near $1.6 trillion and same-day delivery to most major metro areas.", price: 33.72, prevPrice: 33.53, authorityScore: 90, marketCap: "$1.6T" },
-  { name: "Helivant Energy", ticker: "HLVT.m", category: "stocks", subsection: "Energy", network: "nasdaq", tagline: "An integrated supermajor with upstream, midstream, and refining operations across four continents, market capitalization near $480 billion.", price: 47.90, prevPrice: 48.14, authorityScore: 82, marketCap: "$480B" },
-  { name: "Voltrix Motors", ticker: "VLTX.m", category: "stocks", subsection: "Consumer Discretionary", network: "nasdaq", tagline: "The category-defining electric vehicle and energy storage manufacturer, market capitalization near $980 billion, with vertically integrated battery production.", price: 248.30, prevPrice: 245.10, authorityScore: 93, marketCap: "$980B" },
-  { name: "Nexalink Holdings", ticker: "NXLK.m", category: "stocks", subsection: "Technology", network: "nasdaq", tagline: "The parent company of the world's largest social and messaging platforms by daily active users, market capitalization near $920 billion.", price: 612.40, prevPrice: 608.95, authorityScore: 91, marketCap: "$920B" },
-
-  // Private Stocks & Pre-IPO
-  { name: "Vector Orbital Systems \u2014 Core Secondary SPV", ticker: "pVECTOR", category: "privateStocks", subsection: "Special Purpose Vehicles (SPVs)", network: "phaseNative", tagline: "A single-purpose vehicle holding a secondary position in a fictional private orbital launch company ahead of a potential IPO.", price: 217.44, prevPrice: 217.61, authorityScore: 75 },
-  { name: "Cognivault Labs \u2014 Series G Fractional", ticker: "pCOGNI", category: "privateStocks", subsection: "Late-Stage Venture", network: "phaseNative", tagline: "Late-stage equity in a fictional private foundation-model AI lab preparing for a public listing.", price: 99.80, prevPrice: 99.76, authorityScore: 67 },
-
-  // Real Estate
-  { name: "Austin Multi-Family Residential Yield", ticker: "rATX-RES", category: "realEstate", subsection: "Residential", network: "phaseNative", tagline: "A 1,200-unit institutional-grade multi-family residential portfolio across four stabilized Austin properties, generating consistent monthly rental income.", price: 113.95, prevPrice: 114.71, authorityScore: 80 },
-  { name: "NYC Logistics Hub Commercial Trust", ticker: "rNYC-COM", category: "realEstate", subsection: "Commercial", network: "phaseNative", tagline: "A 2.4-million-square-foot last-mile logistics and distribution complex serving the greater New York metro area, leased to a long-term anchor tenant.", price: 410.30, prevPrice: 410.05, authorityScore: 86 },
-
-  // Energy
-  { name: "West Texas Wind Farms (Tokenized Yield)", ticker: "eWTX-WT", category: "energy", subsection: "Renewables", network: "phaseNative", tagline: "A utility-scale West Texas wind portfolio under long-term power purchase agreements with regional utilities.", price: 186.37, prevPrice: 186.93, authorityScore: 79 },
-  { name: "Permian Basin Midstream Fractional", ticker: "ePRM-OIL", category: "energy", subsection: "Oil & Gas", network: "phaseNative", tagline: "Fractional royalty interest in Permian Basin midstream infrastructure, paying out a share of throughput revenue.", price: 52.33, prevPrice: 52.46, authorityScore: 58 },
-
-  // Finance \u2014 private credit and venture funds are fictional; the four
-  // tokenized Treasury/money-market funds below reference real, named funds
-  // and the real networks that actually issue them.
-  { name: "Middle-Market Senior Secured Loan Fund", ticker: "cMM-SEC", category: "finance", subsection: "Private Credit", network: "phaseNative", tagline: "A senior secured private credit fund lending to lower-middle-market businesses at fixed yield.", price: 106.28, prevPrice: 106.53, authorityScore: 72 },
-  { name: "B2B SaaS ARR Factoring Pool", ticker: "cSaaS-ARR", category: "finance", subsection: "Venture & Private Equity", network: "phaseNative", tagline: "A revenue-based financing pool that advances capital against recurring SaaS revenue contracts.", price: 28.23, prevPrice: 28.37, authorityScore: 61 },
-  { name: "Fidelity Treasury Digital Fund \u2014 OnChain (FYHXX)", ticker: "FYHXX", category: "finance", subsection: "Tokenized Funds", network: "fidelity", tagline: "Onchain share class of Fidelity's Treasury Digital Fund, recorded onchain, holding cash and U.S. Treasury securities.", price: 1.24, prevPrice: 1.25, authorityScore: 90, learnMoreUrl: "https://finance.yahoo.com/quote/FYHXX" },
-  { name: "BlackRock USD Institutional Digital Liquidity Fund (BUIDL)", ticker: "BUIDL", category: "finance", subsection: "Tokenized Funds", network: "ethereum", tagline: "A tokenized fund holding cash and U.S. Treasury bills, issued on Ethereum in partnership with Securitize.", price: 1.05, prevPrice: 1.04, authorityScore: 92, learnMoreUrl: "https://en.wikipedia.org/wiki/BlackRock" },
-  { name: "Ondo Short-Term US Government Treasuries (OUSG)", ticker: "OUSG", category: "finance", subsection: "Tokenized Funds", network: "ethereum", tagline: "A tokenized fund providing exposure to short-term U.S. government Treasuries, issued on Ethereum.", price: 0.99, prevPrice: 0.99, authorityScore: 86, learnMoreUrl: "https://en.wikipedia.org/wiki/Ondo_Finance" },
-  { name: "Canton Network Wholesale Settlement Coin", ticker: "cUSD-W", category: "finance", subsection: "Tokenized Funds", network: "canton", tagline: "Tracks tokenized wholesale settlement activity on the Canton Network, the institutional rail used by DTCC for onchain Treasury custody pilots.", price: 95.99, prevPrice: 95.97, authorityScore: 88, learnMoreUrl: "https://en.wikipedia.org/wiki/Canton_Network" },
-
-  // Small Businesses
-  { name: "Toronto Premium Hospitality Pool", ticker: "sTO-REST", category: "smallBusiness", subsection: "Hospitality & Retail", network: "phaseNative", tagline: "A pooled vault of profitable Toronto-area restaurants and hospitality venues with consistent cash flow.", price: 9.64, prevPrice: 9.56, authorityScore: 55 },
-  { name: "Boutique Retail Franchise Vault", ticker: "sRTL-FRAN", category: "smallBusiness", subsection: "Hospitality & Retail", network: "phaseNative", tagline: "A vault of boutique retail franchise locations generating royalty and franchise-fee income.", price: 12.03, prevPrice: 12.13, authorityScore: 60 },
-  { name: "Midwest Last-Mile Logistics Fleet", ticker: "sMW-LOG", category: "smallBusiness", subsection: "Logistics & Supply", network: "phaseNative", tagline: "A fleet of last-mile delivery contracts across the Midwest, generating recurring logistics revenue.", price: 14.51, prevPrice: 14.63, authorityScore: 63 },
-  { name: "Tri-State Municipal Fiber Expansion", ticker: "sTS-FIBR", category: "smallBusiness", subsection: "Local Infrastructure", network: "phaseNative", tagline: "A municipal fiber-optic buildout generating recurring infrastructure access fee revenue.", price: 7.68, prevPrice: 7.61, authorityScore: 49 },
-
-  // Social Media & Audience Capital (fictional creators written at the scale
-  // of genuine top-tier influencers \u2014 no real public figures are used)
-  { name: "Top-Tier Tech Review Channel Equity", ticker: "aYT-TECH", category: "socialMedia", subsection: "YouTube Content Channels", network: "phaseNative", tagline: "One of the largest technology review channels in the world, with over 28 million subscribers and a multi-year exclusive sponsorship deal with three Fortune 500 hardware brands.", followers: "28400000", engagement: "6.4", price: 184.20, prevPrice: 182.65, authorityScore: 89 },
-  { name: "Global Pop Culture Network", ticker: "aTK-POP", category: "socialMedia", subsection: "TikTok Creators", network: "phaseNative", tagline: "A top-five global entertainment and pop culture account with over 61 million followers, generating revenue from platform creator funds, brand partnerships, and a licensed merchandise line.", followers: "61200000", engagement: "9.1", price: 312.80, prevPrice: 309.40, authorityScore: 92 },
-  { name: "Financial Distribution Network", ticker: "aX-FIN", category: "socialMedia", subsection: "X Audience Distribution Networks", network: "phaseNative", tagline: "A leading financial commentary and newsletter network with 4.2 million combined followers across its flagship accounts and a paid subscriber base exceeding 90,000.", followers: "4200000", engagement: "5.6", price: 96.50, prevPrice: 95.80, authorityScore: 81 },
-
-  // Arts
-  { name: "Blue-Chip Fine Art Fractional (Modern Pool)", ticker: "fART-MOD", category: "arts", subsection: "High-Value Fine Art", network: "phaseNative", tagline: "A fractionalized vault of blue-chip 20th-century fine art held in climate-controlled storage with tracked provenance.", price: 10.34, prevPrice: 10.36, authorityScore: 52 },
-  { name: "Generative Fine Art (Glyphwork Vault)", ticker: "vGLYPH", category: "arts", subsection: "Digital Generative Collections (NFTs)", network: "ethereum", tagline: "A generative art collection with royalties flowing back to fractional holders on every secondary sale.", price: 3.89, prevPrice: 3.87, authorityScore: 46 },
-
-  // Collectibles
-  { name: "Heritage Chronograph & Watch Basket", ticker: "wPATEK", category: "collectibles", subsection: "Chronographs & Watches", network: "phaseNative", tagline: "A basket of vintage and modern luxury chronographs, appraised and insured for fractional ownership.", price: 57.12, prevPrice: 56.83, authorityScore: 57 },
-  { name: "Fine Wine & Rare Spirits Allocation Fund", ticker: "wWINE", category: "collectibles", subsection: "Rare Assets", network: "phaseNative", tagline: "A temperature-controlled allocation fund of fine wine and rare spirits held for long-term appreciation.", price: 22.83, prevPrice: 22.74, authorityScore: 50 },
-  { name: "Heritage Racing & Luxury Automotive Vault", ticker: "wRACE", category: "collectibles", subsection: "Luxury Automotives", network: "phaseNative", tagline: "A vault of fully restored heritage racing and luxury automobiles with documented provenance.", price: 139.57, prevPrice: 139.08, authorityScore: 53 },
-
-  // Sports & Talent
-  { name: "Draft-Eligible QB Income Share (ISA)", ticker: "tISA-NFL26", category: "sportsTalent", subsection: "Athlete Income Share Agreements (ISAs)", network: "phaseNative", tagline: "A draft-eligible quarterback tokenizing a share of future professional contract and endorsement income.", followers: "96000", engagement: "6.1", price: 43.58, prevPrice: 43.72, authorityScore: 71 },
-  { name: "ATP Tour Rising Star Income Share (ISA)", ticker: "tISA-ATP", category: "sportsTalent", subsection: "Athlete Income Share Agreements (ISAs)", network: "phaseNative", tagline: "A rising professional tennis player tokenizing future prize money and sponsorship income.", followers: "58000", engagement: "7.3", price: 20.71, prevPrice: 20.56, authorityScore: 65 },
-  { name: "Phase Pipeline Quant-Alpha Dev Team", ticker: "tDEV-ALPHA", category: "sportsTalent", subsection: "Independent Developer Alpha Pipelines", network: "phaseNative", tagline: "An independent quantitative developer team tokenizing future royalties across an early trading-tools pipeline.", followers: "31000", engagement: "5.4", price: 14.56, prevPrice: 14.62, authorityScore: 48 },
-
-  // Intellectual Property
-  { name: "90s Alternative Rock Master Catalogues", ticker: "ipROCK", category: "intellectualProperty", subsection: "Music Royalty Catalogues", network: "phaseNative", tagline: "A catalogue of 1990s alternative rock master recordings with steady sync licensing and streaming royalty income.", price: 26.83, prevPrice: 26.71, authorityScore: 68 },
-  { name: "LEO Satellite Communication Patent Pool", ticker: "ipSAT-PAT", category: "intellectualProperty", subsection: "Patent Pools", network: "phaseNative", tagline: "A pool of low-earth-orbit satellite communication patents generating licensing income from three operators.", price: 16.81, prevPrice: 16.87, authorityScore: 54 },
-  { name: "Open Restaking Primitive Extension", ticker: "ipOSS-RSTK", category: "intellectualProperty", subsection: "Open-Source Software Protocols", network: "ethereum", tagline: "A funding pool backing an open-source restaking protocol extension, distributing a share of protocol fee revenue to backers.", price: 7.78, prevPrice: 7.73, authorityScore: 45 },
-];
-
-function platformFromSubsection(subsection) {
-  if (!subsection) return null;
-  if (subsection.includes("YouTube")) return "YouTube";
-  if (subsection.includes("TikTok")) return "TikTok";
-  if (subsection.includes("X Audience")) return "X";
-  return null;
-}
-
-function hydrateMockAsset(seed) {
-  const price = seed.price;
-  // History ends on the actual current price, with the second-to-last point
-  // anchored to the seed's explicit prevPrice (if given) so the displayed
-  // 24h change% matches the curated reference figures exactly, while earlier
-  // history points still vary for a believable sparkline shape.
-  const prevPrice = seed.prevPrice != null ? seed.prevPrice : price;
-  const history = Array.from({ length: 11 }, () => price * (0.96 + Math.random() * 0.08));
-  history.push(prevPrice, price);
-  const network = seed.network || "phaseNative";
-  // Only listings settling on Phase's own rail are sovereign chains issued
-  // through the Go Live flow — assets brought in from Canton, Nasdaq,
-  // Fidelity, or Ethereum are already-verified products living on someone
-  // else's network, so they don't get a Phase-issued chainId.
-  const isSovereignChain = network === "phaseNative";
-  const publicShares = isSovereignChain ? Math.round(SOVEREIGN_TOTAL_SHARES * 0.25) : null;
-  return {
-    id: uid(),
-    name: seed.name,
-    ticker: seed.ticker || "",
-    category: seed.category,
-    subsection: seed.subsection,
-    network,
-    tagline: seed.tagline,
-    marketCap: seed.marketCap || null,
-    platform: seed.followers ? platformFromSubsection(seed.subsection) || "YouTube" : null,
-    followers: seed.followers || "",
-    engagement: seed.engagement || "",
-    socialUrl: null,
-    socialProfiles: [],
-    verification: null, // no social verification yet -- links render as plain unverified links
-    compliance: { docFileName: "on-file.pdf", licenseNumber: "DEMO-" + uid().toUpperCase(), consented: true },
-    equityPublic: 25,
-    equityRetained: 75,
-    price,
-    prevPrice,
-    history,
-    tickDir: "up",
-    tickDirection: "FLAT",
-    isOwner: false,
-    isMock: true,
-    authorityScore: seed.authorityScore,
-    // External "learn more" link. Mock listings reference real, named
-    // companies/funds/networks, so a search link to a finance/reference
-    // source is genuinely useful here; explicit overrides win when provided.
-    learnMoreUrl:
-      seed.learnMoreUrl ||
-      `https://www.google.com/search?q=${encodeURIComponent(seed.name + " finance")}`,
-
-    // Sovereign ledger fields — only populated for Phase-native chains.
-    chainId: isSovereignChain ? generateChainId() : null,
-    zeroBaseFee: isSovereignChain,
-    totalMinted: isSovereignChain ? SOVEREIGN_TOTAL_SHARES : null,
-    publicFloatShares: publicShares,
-    retainedShares: isSovereignChain ? SOVEREIGN_TOTAL_SHARES - publicShares : null,
-    chainHistory: isSovereignChain ? [genesisBlock(seed.name, seed.ticker || "PHASE")] : [],
-    phaseCoinPool: isSovereignChain ? 0 : null,
-  };
-}
 
 /* ------------------------- Phi guide brain (demo) ------------------------- */
 // Conversational mock brain for Phi, the in-app guide. Today it answers from
@@ -765,7 +657,7 @@ function getPhiReply(rawText) {
   }
   if (has("invest", "buy", "purchase", "allocat")) {
     return {
-      text: "The Marketplace is the live directory of every listed person, business, and asset. Pick one, choose your currency \u2014 cash, stablecoin, or crypto \u2014 and invest. Trades settle live on each coin's own Phase chain; balances are test funds while real-money rails are being connected.",
+      text: "The Marketplace is the live directory of every listed person, business, and asset. Pick one, choose your currency \u2014 cash, stablecoin, or crypto \u2014 and invest. Trades settle live on each coin's own Phase chain.",
       actions: [{ label: "Open Marketplace", tab: "market" }],
       suggestions: ["How do I go live?", "Is this real money?"],
     };
@@ -792,13 +684,13 @@ function getPhiReply(rawText) {
   }
   if (has("fee", "cost", "price", "charge", "free", "real money")) {
     return {
-      text: "Trading on Phase is free while we launch \u2014 no real money moves yet; balances are test funds. When live rails connect, fees and terms will be shown before you confirm anything.",
+      text: "Trading on Phase is free while we launch. Fees and terms will be shown before you confirm anything.",
       suggestions: ["How do I go live?", "How does investing work?"],
     };
   }
   if (has("wallet", "fund", "usdc", "circle", "deposit", "crypto")) {
     return {
-      text: "You can add test balances from the Dashboard to try everything end to end. Card funding runs in test mode and crypto funding is being wired up \u2014 no real money moves yet.",
+      text: "You can fund your account from the Dashboard. Card funding is not available yet; crypto funding is being connected.",
       actions: [{ label: "Open Dashboard", tab: "dashboard" }],
       suggestions: ["Is this real money?"],
     };
@@ -1459,7 +1351,7 @@ function Icon({ name, size = 18 }) {
 =========================================================================== */
 
 /* ------------------------- Auth screen ------------------------- */
-function AuthScreen({ onAuthSuccess, initialMode = "signup" }) {
+function AuthScreen({ onAuthSuccess, initialMode = "signup", notice, onOpenPrivacy }) {
   const [mode, setMode] = useState(initialMode); // signup | login | forgot | reset
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -1543,6 +1435,7 @@ function AuthScreen({ onAuthSuccess, initialMode = "signup" }) {
       <div className="glass-card auth-card">
         <h2 className="section-title">{modeTitle}</h2>
         <p className="section-sub">{modeSub}</p>
+        {notice && <p className="auth-notice">{notice}</p>}
         <form onSubmit={submit} className="auth-form">
           {mode === "signup" && (
             <label className="field">
@@ -1586,6 +1479,129 @@ function AuthScreen({ onAuthSuccess, initialMode = "signup" }) {
             Back to log in
           </button>
         )}
+        {mode === "signup" && (
+          <p className="auth-legal">
+            By signing up you agree to our{" "}
+            <button type="button" className="link-btn" onClick={onOpenPrivacy}>
+              Privacy Policy
+            </button>
+            .
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------- Account modals ------------------------- */
+// Privacy policy viewer. Content is PRIVACY_POLICY (draft — legal review
+// required before production).
+function PrivacyPolicyModal({ onClose }) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card terms-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="icon-btn modal-close" onClick={onClose}>
+          <Icon name="close" size={18} />
+        </button>
+        <h3>Privacy Policy</h3>
+        <div className="terms-body">
+          {PRIVACY_POLICY.split("\n\n").map((para, i) => (
+            <p key={i}>{para}</p>
+          ))}
+        </div>
+        <button className="btn-primary btn-full" onClick={onClose}>
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Delete-account confirmation: explains permanence and requires the
+// account password before calling DELETE /api/v1/auth/account.
+function DeleteAccountModal({ onClose, onDeleted }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(null);
+    if (!password) {
+      setError("Enter your password to confirm deletion.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await authApi.deleteAccount(password);
+      onDeleted();
+    } catch (err) {
+      setError(err.message || "Could not delete your account. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <button className="icon-btn modal-close" onClick={onClose}>
+          <Icon name="close" size={18} />
+        </button>
+        <h3 className="danger-title">Delete Account</h3>
+        <p className="section-sub">
+          This permanently deletes your account, all issued assets, transaction
+          history, and personal data. This cannot be undone.
+        </p>
+        <form onSubmit={submit} className="auth-form">
+          <label className="field">
+            <span className="field-label">Confirm with your password</span>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Your password"
+              autoComplete="current-password"
+            />
+          </label>
+          {error && <p className="auth-error">{error}</p>}
+          <button type="submit" className="btn-danger btn-full" disabled={busy}>
+            {busy ? "Deleting…" : "Permanently delete my account"}
+          </button>
+          <button type="button" className="btn-secondary btn-full" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// Account settings: user info, privacy policy link, delete-account entry.
+function AccountModal({ authUser, onClose, onOpenPrivacy, onOpenDelete }) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <button className="icon-btn modal-close" onClick={onClose}>
+          <Icon name="close" size={18} />
+        </button>
+        <h3>Account</h3>
+        {authUser && (
+          <div className="account-info">
+            {authUser.name ? <p className="account-name">{authUser.name}</p> : null}
+            {authUser.email ? <p className="account-email">{authUser.email}</p> : null}
+          </div>
+        )}
+        <button className="link-btn account-row" onClick={onOpenPrivacy}>
+          Privacy Policy
+        </button>
+        <div className="account-danger-zone">
+          <p className="danger-zone-label">Danger zone</p>
+          <button className="btn-danger btn-full" onClick={onOpenDelete}>
+            Delete Account
+          </button>
+        </div>
+        <button className="btn-secondary btn-full" onClick={onClose}>
+          Close
+        </button>
       </div>
     </div>
   );
@@ -1604,6 +1620,10 @@ class PhaseErrorBoundary extends React.Component {
   componentDidCatch(error, info) {
     try {
       console.error("Phase render crash:", error, info);
+    } catch {}
+    // Report to Sentry when configured; fails silently otherwise.
+    try {
+      reportError(error, info && info.componentStack ? { componentStack: info.componentStack } : undefined);
     } catch {}
   }
   render() {
@@ -1634,6 +1654,10 @@ function AppInner() {
   const [authReady, setAuthReady] = useState(false);
   const isAndroid = useMemo(() => /Android/.test(navigator.userAgent || ""), []);
   const [showSplash, setShowSplash] = useState(true);
+  // Account modals: null | "account" | "privacy" | "delete"
+  const [accountModal, setAccountModal] = useState(null);
+  // Notice shown on the auth screen (e.g. after account deletion).
+  const [authNotice, setAuthNotice] = useState(null);
   // Welcoming splash: Phase mark on open, fades away quickly.
   useEffect(() => {
     const t = setTimeout(() => setShowSplash(false), 1400);
@@ -1737,7 +1761,7 @@ function AppInner() {
   const [updateInfo, setUpdateInfo] = useState(null); // GitHub release update offer
   const [phaseCoins, setPhaseCoins] = useState(0);
   const [currency, setCurrency] = useState("usd");
-  const [assets, setAssets] = useState(() => MOCK_LISTINGS_SEED.map(hydrateMockAsset)); // live directory, seeded with mock listings
+  const [assets, setAssets] = useState([]); // live directory — populated from the backend only
   const [holdings, setHoldings] = useState([]); // { assetId, units, costBasisUsd }
   const [txHistory, setTxHistory] = useState([]);
   const [cashBalances, setCashBalances] = useState({}); // { usd: 0, cad: 0, usdc: 0, ... } funded cash, separate from PHASE coins
@@ -1758,7 +1782,7 @@ function AppInner() {
   useEffect(() => {
     refreshTradeBalances();
   }, [refreshTradeBalances]);
-  const [cryptoFunded, setCryptoFunded] = useState(false); // true once real testnet balances are detected
+  const [cryptoFunded, setCryptoFunded] = useState(false); // true once crypto balances are detected
   const [hasIssuedCoin, setHasIssuedCoin] = useState(false); // true once the user mints their own coin
   const [netWorthHistory, setNetWorthHistory] = useState([]); // [{ t, valueUsd }] for the dashboard trend line
   const [chatOpen, setChatOpen] = useState(false);
@@ -1781,7 +1805,8 @@ function AppInner() {
           setSovereignWallet(w);
         }
       } catch (e) {
-        console.warn("sovereign wallet init failed", e);
+        console.error("sovereign wallet init failed", e);
+        showToast("Wallet initialization failed — issuance is unavailable. Please restart the app.");
       }
     })();
   }, []);
@@ -1792,8 +1817,8 @@ function AppInner() {
     showToast._t = window.setTimeout(() => setToast(null), 2600);
   }, []);
 
-  // Poll real crypto funding balances — unlocks the dashboard once testnet
-  // deposits land (or once the user mints their own coin).
+  // Poll crypto funding balances — unlocks the dashboard once deposits
+  // land (or once the user mints their own coin).
   const refreshFundingStatus = useCallback(async () => {
     try {
       const data = await fundingApi.getBalances(currentUserId());
@@ -1830,67 +1855,6 @@ function AppInner() {
     };
   }, []);
 
-  // Live FX rate drift \u2014 simulates real-time currency data so portfolio
-  // valuation actually shifts per-currency on the dashboard, not just per-asset.
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setLiveFx((prev) => {
-        const next = { ...prev };
-        Object.keys(BASE_FX).forEach((id) => {
-          if (id === "usd") return; // USD is the numeraire, stays fixed
-          const driftPct =
-            CURRENCIES.find((c) => c.id === id)?.group === "Crypto"
-              ? (Math.random() - 0.5) * 0.012
-              : (Math.random() - 0.5) * 0.0015;
-          next[id] = prev[id] * (1 + driftPct);
-        });
-        return next;
-      });
-    }, 2500);
-    return () => clearInterval(interval);
-  }, []);
-
-  // Live price simulation — also doubles as the sovereign chain's "sensory
-  // price daemon": every tick appends a block to that chain's isolated
-  // history and stamps an explicit UP/DOWN/FLAT direction. Each asset's
-  // jitter is entirely self-contained, so one chain's volatility can never
-  // spill into another's price or liquidity.
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setAssets((prev) =>
-        prev.map((a) => {
-          const pctMove = (Math.random() - 0.48) * (a.chainId ? CHAIN_JITTER_PCT : 0.018);
-          const newPrice = Math.max(0.5, a.price * (1 + pctMove));
-          const history = [...a.history.slice(-23), newPrice];
-          const direction = newPrice > a.price ? "UP" : newPrice < a.price ? "DOWN" : "FLAT";
-
-          if (!a.chainId) {
-            return { ...a, prevPrice: a.price, price: newPrice, history, tickDir: direction === "DOWN" ? "down" : "up" };
-          }
-
-          // Sovereign-chain assets also accrue block history and a slow
-          // PHASE coin drip into their own isolated pool while live.
-          const nextBlock = {
-            height: a.chainHistory.length,
-            label: `Block ${a.chainHistory.length}`,
-            detail: `Price tick ${direction === "UP" ? "▲" : direction === "DOWN" ? "▼" : "→"} ${formatCurrency(newPrice, "usd", BASE_FX)}`,
-            time: Date.now(),
-          };
-          return {
-            ...a,
-            prevPrice: a.price,
-            price: newPrice,
-            history,
-            tickDir: direction === "DOWN" ? "down" : "up",
-            tickDirection: direction,
-            chainHistory: [...a.chainHistory.slice(-49), nextBlock],
-            phaseCoinPool: (a.phaseCoinPool || 0) + PHASE_CHAIN_INFLOW_PER_CYCLE,
-          };
-        })
-      );
-    }, 2500);
-    return () => clearInterval(interval);
-  }, []);
 
   // Net worth, computed once here so both the dashboard figure and the
   // trend-line history snapshot stay perfectly in sync.
@@ -1928,30 +1892,33 @@ function AppInner() {
     const publicShares = Math.round(totalShares * ((form.equityPublic || 0) / 100));
     const retainedShares = totalShares - publicShares;
 
-    // Create a real sovereign chain on the backend (Phase 1 MVP).
-    // Falls back to local-only mode if the backend is unreachable.
-    let sovereignChainId = form.chainIdOverride || generateChainId();
-    let sovereignLive = false;
-    if (sovereignWallet) {
-      try {
-        showToast("Creating your sovereign chain...");
-        const res = await createSovereignChain({
-          coinName: form.name,
-          ticker: generatedTicker,
-          totalSupply: String(totalShares),
-          decimals: 6,
-          issuerAddress: sovereignWallet.address,
-          allowMint: true,
-        });
-        if (res.status === 201 && res.json.chain_id) {
-          sovereignChainId = res.json.chain_id;
-          sovereignLive = true;
-        } else {
-          console.warn("sovereign chain creation failed, using local mode", res.json);
-        }
-      } catch (e) {
-        console.warn("sovereign chain creation error, using local mode", e);
+    // Create a real sovereign chain on the backend. There is no local-only
+    // fallback: if the backend is unreachable, issuance fails loudly and
+    // nothing is created.
+    if (!sovereignWallet) {
+      showToast("Issuance failed: wallet not ready. Your asset was NOT created. Please try again.");
+      return null;
+    }
+    let sovereignChainId;
+    try {
+      showToast("Creating your sovereign chain...");
+      const res = await createSovereignChain({
+        coinName: form.name,
+        ticker: generatedTicker,
+        totalSupply: String(totalShares),
+        decimals: 6,
+        issuerAddress: sovereignWallet.address,
+        allowMint: true,
+      });
+      if (res.status === 201 && res.json.chain_id) {
+        sovereignChainId = res.json.chain_id;
+      } else {
+        throw new Error((res.json && res.json.message) || "Sovereign chain creation failed.");
       }
+    } catch (e) {
+      console.error("sovereign chain creation failed", e);
+      showToast("Issuance failed: could not reach the server. Your asset was NOT created. Please try again.");
+      return null;
     }
     const newAsset = {
       id: uid(),
@@ -1973,7 +1940,7 @@ function AppInner() {
       equityRetained: 100 - form.equityPublic,
       price: initialPrice,
       prevPrice: initialPrice,
-      history: Array.from({ length: 12 }, () => initialPrice * (0.97 + Math.random() * 0.06)),
+      history: [], // no fabricated price history — fills in from real market data
       tickDir: "up",
       tickDirection: "FLAT",
       isOwner: true,
@@ -1988,20 +1955,16 @@ function AppInner() {
       // sandboxes each person/asset's trading activity so no chain's
       // volatility or liquidity can drag on any other chain's price.
       chainId: sovereignChainId,
-      sovereignLive, // true if a real backend chain was provisioned
+      sovereignLive: true, // a real backend chain was provisioned (issuance fails loudly otherwise)
       zeroBaseFee: true,
       totalMinted: totalShares,
       publicFloatShares: publicShares,
       retainedShares,
       chainHistory: [genesisBlock(form.name, generatedTicker)],
-      phaseCoinPool: 0, // grows via the periodic PHASE inflow engine while the chain is live
+      phaseCoinPool: 0,
     };
     setAssets((prev) => [newAsset, ...prev]);
-    showToast(
-      sovereignLive
-        ? `${form.name} is live on its sovereign chain`
-        : `${form.name} is live (local mode — backend unreachable)`
-    );
+    showToast(`${form.name} is live on its sovereign chain`);
     setHasIssuedCoin(true);
     setActiveTab("market");
     return newAsset;
@@ -2056,7 +2019,7 @@ function AppInner() {
         showToast(`Bought ${units} ${asset.ticker} — $${paidUsd.toFixed(2)} sent to the issuer`);
       } catch (e) {
         if (e.code === "insufficient_funds" || e.status === 402) {
-          showToast("Not enough trade USD — add test funds and try again");
+          showToast("Not enough trade USD — fund your account and try again");
         } else {
           showToast(e.message || "Trade failed — please try again");
         }
@@ -2213,6 +2176,7 @@ function AppInner() {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         authUser={authUser}
+        onOpenAccount={() => { setAuthNotice(null); setAccountModal("account"); }}
         onLogout={async () => {
           await authApi.logout();
           setAuthUser(null);
@@ -2223,7 +2187,10 @@ function AppInner() {
       <main className="app-main">
         {activeTab === "golive" && !authUser && authReady && (
           <AuthScreen
+            notice={authNotice}
+            onOpenPrivacy={() => setAccountModal("privacy")}
             onAuthSuccess={(u) => {
+              setAuthNotice(null);
               setAuthUser(u);
               refreshTradeBalances();
               refreshFundingStatus();
@@ -2307,6 +2274,32 @@ function AppInner() {
 
       {showNews && <NewsDrawer onClose={() => setShowNews(false)} />}
 
+      {accountModal === "account" && (
+        <AccountModal
+          authUser={authUser}
+          onClose={() => setAccountModal(null)}
+          onOpenPrivacy={() => setAccountModal("privacy")}
+          onOpenDelete={() => setAccountModal("delete")}
+        />
+      )}
+      {accountModal === "privacy" && (
+        <PrivacyPolicyModal onClose={() => setAccountModal(authUser ? "account" : null)} />
+      )}
+      {accountModal === "delete" && (
+        <DeleteAccountModal
+          onClose={() => setAccountModal("account")}
+          onDeleted={() => {
+            // Full local wipe: session, remembered login, and all cached data.
+            try { localStorage.clear(); } catch {}
+            try { window.dispatchEvent(new CustomEvent("phase:auth-changed")); } catch {}
+            setAuthUser(null);
+            setAccountModal(null);
+            setActiveTab("golive");
+            setAuthNotice("Your account has been permanently deleted.");
+          }}
+        />
+      )}
+
 
       {updateInfo && (
         <UpdateDialog
@@ -2357,7 +2350,7 @@ function SplashScreen() {
   );
 }
 
-function TopNav({ activeTab, setActiveTab, authUser, onLogout }) {
+function TopNav({ activeTab, setActiveTab, authUser, onLogout, onOpenAccount }) {
   const tabs = [
     { id: "golive", label: "Go Live", icon: "directory" },
     { id: "dashboard", label: "Dashboard", icon: "dashboard" },
@@ -2389,9 +2382,14 @@ function TopNav({ activeTab, setActiveTab, authUser, onLogout }) {
       </nav>
       <div className="top-nav-right">
         {authUser ? (
-          <button className="link-btn nav-logout" onClick={onLogout} title={authUser.email}>
-            Log out
-          </button>
+          <>
+            <button className="icon-btn nav-account" onClick={onOpenAccount} title="Account settings">
+              <Icon name="person" size={20} />
+            </button>
+            <button className="link-btn nav-logout" onClick={onLogout} title={authUser.email}>
+              Log out
+            </button>
+          </>
         ) : null}
       </div>
     </header>
@@ -3020,8 +3018,7 @@ function GoLiveTab({ onPublish, issuerAddress }) {
           />
         </div>
         <p className="field-hint">
-          This is your chain's opening valuation anchor. It will drift with simulated market activity
-          once you're live, but you set where it starts.
+          This is your chain's opening valuation anchor. You set where it starts.
         </p>
 
         <label className="field-label">Fractionalization &amp; Sovereign Split</label>
@@ -3955,11 +3952,6 @@ function BringYourOwnNetworkFlow({ onBack, onPublish }) {
           rows={3}
         />
 
-        <p className="field-hint demo-hint">
-          Prototype simulation — there is no live cross-chain verification here. In a production version,
-          Phase would confirm this product's status directly with the source network before listing it.
-        </p>
-
         <button
           className={`btn-primary btn-large btn-pulse ${!canSubmit ? "btn-disabled" : ""}`}
           onClick={handleSubmit}
@@ -4297,7 +4289,6 @@ function FundAccountModal({ onClose, onFund }) {
 
   const address = depositInfo?.addresses?.[chain];
   const totals = balances?.totals || {};
-  const testnet = depositInfo?.testnet;
   const chainLabel = (CHAINS.find((c) => c.id === chain) || {}).label || chain;
 
   return (
@@ -4349,7 +4340,6 @@ function FundAccountModal({ onClose, onFund }) {
             <>
             <p className="section-sub">
               Send {currency} from your external wallet to the address below.
-              {testnet ? " Testnet funds — no real money." : ""}
             </p>
 
             <label className="field-label">Network</label>
@@ -4417,7 +4407,7 @@ function FundAccountModal({ onClose, onFund }) {
             <h3>Watching for your deposit…</h3>
             <p className="section-sub">
               We&apos;re monitoring the blockchain for incoming {currency}. This usually takes
-              under a minute on testnet. You can close this and come back — your funds are safe.
+              under a minute. You can close this and come back — your funds are safe.
             </p>
             <p className="field-hint">Checked {pollCount} time{pollCount === 1 ? "" : "s"}</p>
             <button className="btn btn-ghost" onClick={stopWaiting}>Back to address</button>
@@ -6280,7 +6270,6 @@ function ChatbotLauncher({ open, setOpen, onNavigate }) {
           <div className="chat-panel-header">
             <PhiMark size={22} animated={false} />
             <span>Phi \u2014 your guide</span>
-            <span className="chat-demo-badge">Demo</span>
           </div>
           <div className="chat-panel-body" ref={bodyRef}>
             {history.map((msg, i) => (
@@ -6339,7 +6328,6 @@ function ChatbotLauncher({ open, setOpen, onNavigate }) {
               <Icon name="arrowRight" size={16} />
             </button>
           </form>
-          <div className="chat-demo-note">Demo answers \u2014 live AI connects with an API key.</div>
         </div>
       )}
     </>
@@ -6580,6 +6568,40 @@ function GlobalStyles() {
         padding: 9px 16px; cursor: pointer; transition: background 0.2s ease;
       }
       .btn-secondary:hover { background: rgba(14,165,233,0.18); }
+
+      .btn-danger {
+        background: linear-gradient(135deg, #dc2626, #991b1b);
+        color: white; border: none; border-radius: 14px;
+        font-family: 'Outfit'; font-weight: 700; font-size: 14px;
+        padding: 12px 20px; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; justify-content: center;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+      }
+      .btn-danger:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(220,38,38,0.3); }
+      .btn-danger:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+      .danger-title { color: #dc2626; }
+      .danger-zone-label {
+        font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+        color: #dc2626; opacity: 0.8; margin: 0 0 8px;
+      }
+      .account-danger-zone {
+        margin: 20px 0; padding: 16px; border: 1px solid rgba(220,38,38,0.35);
+        border-radius: 12px; background: rgba(220,38,38,0.06);
+      }
+      .account-info { margin: 4px 0 12px; }
+      .account-name { font-weight: 700; font-size: 16px; margin: 0; }
+      .account-email { opacity: 0.7; font-size: 14px; margin: 4px 0 0; }
+      .account-row {
+        display: block; width: 100%; text-align: left;
+        padding: 10px 0; font-size: 15px;
+      }
+      .auth-notice {
+        background: rgba(34,197,94,0.12); border: 1px solid rgba(34,197,94,0.35);
+        color: #16a34a; border-radius: 10px; padding: 10px 14px;
+        font-size: 14px; margin: 0 0 12px;
+      }
+      .auth-legal { font-size: 12px; opacity: 0.7; text-align: center; margin: 12px 0 0; }
+      .auth-legal .link-btn { font-size: 12px; padding: 0; }
+      .nav-account { margin-right: 4px; }
 
       .icon-btn {
         background: transparent; border: none; cursor: pointer; color: var(--navy);
