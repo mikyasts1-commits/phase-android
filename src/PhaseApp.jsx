@@ -125,6 +125,12 @@ const authApi = {
     try { await backendFetch("/auth/logout", { method: "POST" }); } catch {}
     clearAuthSession();
   },
+  forgotPassword: (email) =>
+    backendFetch("/auth/forgot-password", { method: "POST", body: { email } }),
+  resetPassword: (token, password) =>
+    backendFetch("/auth/reset-password", { method: "POST", body: { token, password } }),
+  verifyEmail: (token) =>
+    backendFetch("/auth/verify-email", { method: "POST", body: { token } }),
 };
 const issuanceApi = {
   createDraft: (draft) => backendFetch("/issuance/draft", { method: "POST", body: draft }),
@@ -1454,12 +1460,14 @@ function Icon({ name, size = 18 }) {
 
 /* ------------------------- Auth screen ------------------------- */
 function AuthScreen({ onAuthSuccess, initialMode = "signup" }) {
-  const [mode, setMode] = useState(initialMode);
+  const [mode, setMode] = useState(initialMode); // signup | login | forgot | reset
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [resetToken, setResetToken] = useState("");
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
   useEffect(() => {
     try {
       const remembered = JSON.parse(localStorage.getItem("phase_remembered") || "null");
@@ -1477,7 +1485,7 @@ function AuthScreen({ onAuthSuccess, initialMode = "signup" }) {
       setError("Enter a valid email address.");
       return;
     }
-    if (password.length < 8) {
+    if ((mode === "signup" || mode === "login" || mode === "reset") && password.length < 8) {
       setError("Password must be at least 8 characters.");
       return;
     }
@@ -1485,29 +1493,56 @@ function AuthScreen({ onAuthSuccess, initialMode = "signup" }) {
       setError("Enter your name.");
       return;
     }
+    if (mode === "reset" && !resetToken.trim()) {
+      setError("Enter the reset token.");
+      return;
+    }
     setBusy(true);
     try {
-      const res = mode === "signup"
-        ? await authApi.signup(cleanEmail, password, name.trim())
-        : await authApi.login(cleanEmail, password);
-      setAuthSession(res.token, { userId: res.userId, email: res.email, name: res.name });
-      try { localStorage.removeItem("phase_remembered"); } catch {}
-      onAuthSuccess({ userId: res.userId, email: res.email, name: res.name });
+      if (mode === "forgot") {
+        const res = await authApi.forgotPassword(cleanEmail);
+        // Dev mode: backend returns the token directly
+        if (res.resetToken) setResetToken(res.resetToken);
+        setResetSent(true);
+        setMode("reset");
+      } else if (mode === "reset") {
+        await authApi.resetPassword(resetToken.trim(), password);
+        setError(null);
+        setMode("login");
+        setPassword("");
+        setResetToken("");
+        setResetSent(false);
+      } else {
+        const res = mode === "signup"
+          ? await authApi.signup(cleanEmail, password, name.trim())
+          : await authApi.login(cleanEmail, password);
+        setAuthSession(res.token, { userId: res.userId, email: res.email, name: res.name });
+        try { localStorage.removeItem("phase_remembered"); } catch {}
+        onAuthSuccess({ userId: res.userId, email: res.email, name: res.name });
+      }
     } catch (err) {
       setError(err.message || "Something went wrong. Please try again.");
     } finally {
       setBusy(false);
     }
   };
+  const modeTitle = {
+    signup: "Create your account",
+    login: "Welcome back",
+    forgot: "Reset your password",
+    reset: "Enter new password",
+  }[mode];
+  const modeSub = {
+    signup: "Going live creates your Phase account. Your coins and balances follow this account across devices.",
+    login: "Log in to access your dashboard, marketplace, and issued coins.",
+    forgot: "Enter your email and we'll send you a password reset token.",
+    reset: resetSent ? "Enter the reset token and choose a new password." : "Enter the reset token and choose a new password.",
+  }[mode];
   return (
     <div className="auth-wrap">
       <div className="glass-card auth-card">
-        <h2 className="section-title">{mode === "signup" ? "Create your account" : "Welcome back"}</h2>
-        <p className="section-sub">
-          {mode === "signup"
-            ? "Going live creates your Phase account. Your coins and balances follow this account across devices."
-            : "Log in to access your dashboard, marketplace, and issued coins."}
-        </p>
+        <h2 className="section-title">{modeTitle}</h2>
+        <p className="section-sub">{modeSub}</p>
         <form onSubmit={submit} className="auth-form">
           {mode === "signup" && (
             <label className="field">
@@ -1519,24 +1554,81 @@ function AuthScreen({ onAuthSuccess, initialMode = "signup" }) {
             <span className="field-label">Email</span>
             <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" />
           </label>
-          <label className="field">
-            <span className="field-label">Password</span>
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={mode === "signup" ? "At least 8 characters" : "Your password"} autoComplete={mode === "signup" ? "new-password" : "current-password"} />
-          </label>
+          {(mode === "signup" || mode === "login" || mode === "reset") && (
+            <label className="field">
+              <span className="field-label">{mode === "reset" ? "New password" : "Password"}</span>
+              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={mode === "signup" ? "At least 8 characters" : mode === "reset" ? "At least 8 characters" : "Your password"} autoComplete={mode === "signup" || mode === "reset" ? "new-password" : "current-password"} />
+            </label>
+          )}
+          {mode === "reset" && (
+            <label className="field">
+              <span className="field-label">Reset token</span>
+              <input type="text" value={resetToken} onChange={(e) => setResetToken(e.target.value)} placeholder="Paste the reset token" autoComplete="off" />
+            </label>
+          )}
           {error && <p className="auth-error">{error}</p>}
           <button type="submit" className="btn-primary auth-submit" disabled={busy}>
-            {busy ? "Please wait…" : mode === "signup" ? "Sign up & continue" : "Log in"}
+            {busy ? "Please wait…" : mode === "signup" ? "Sign up & continue" : mode === "login" ? "Log in" : mode === "forgot" ? "Send reset token" : "Set new password"}
           </button>
         </form>
-        <button className="link-btn auth-switch" onClick={() => { setMode(mode === "signup" ? "login" : "signup"); setError(null); }}>
-          {mode === "signup" ? "Already have an account? Log in" : "New to Phase? Create an account"}
-        </button>
+        {(mode === "signup" || mode === "login") && (
+          <button className="link-btn auth-switch" onClick={() => { setMode(mode === "signup" ? "login" : "signup"); setError(null); }}>
+            {mode === "signup" ? "Already have an account? Log in" : "New to Phase? Create an account"}
+          </button>
+        )}
+        {mode === "login" && (
+          <button className="link-btn auth-switch" onClick={() => { setMode("forgot"); setError(null); }}>
+            Forgot your password?
+          </button>
+        )}
+        {(mode === "forgot" || mode === "reset") && (
+          <button className="link-btn auth-switch" onClick={() => { setMode("login"); setError(null); setResetSent(false); }}>
+            Back to log in
+          </button>
+        )}
       </div>
     </div>
   );
 }
 
-export default function App() {
+// Error boundary: catches render crashes (e.g. bad data after login) and
+// shows the error instead of a black screen.
+class PhaseErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    try {
+      console.error("Phase render crash:", error, info);
+    } catch {}
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: 24, color: "#fff", background: "#111", minHeight: "100vh" }}>
+          <h2>Something went wrong</h2>
+          <p>Please restart the app. If this keeps happening, contact support.</p>
+          <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, opacity: 0.7 }}>
+            {String(this.state.error && this.state.error.message || this.state.error)}
+          </pre>
+          <button
+            onClick={() => { try { localStorage.clear(); } catch {} window.location.reload(); }}
+            style={{ marginTop: 16, padding: "12px 24px", borderRadius: 8 }}
+          >
+            Reset and reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function AppInner() {
   const [activeTab, setActiveTab] = useState("golive"); // golive | market | dashboard
   const [authUser, setAuthUser] = useState(() => getAuthUser());
   const [authReady, setAuthReady] = useState(false);
@@ -7603,5 +7695,13 @@ function GlobalStyles() {
         .chat-launcher { right: 16px; }
       }
     `}</style>
+  );
+}
+
+export default function App() {
+  return (
+    <PhaseErrorBoundary>
+      <AppInner />
+    </PhaseErrorBoundary>
   );
 }
