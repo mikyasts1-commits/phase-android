@@ -24,6 +24,6 @@ export const CRYPTO_FUNDING_LOCKED = false;
 export const GO_LIVE_LOCKED = false;
 
 // DASHBOARD_LOCKED: when true, the Dashboard shows a simple "fund your
-// account" empty state instead of simulated portfolio and net-worth figures.
+// account" empty state instead of the portfolio dashboard.
 // Set to false to restore the dashboard.
 export const DASHBOARD_LOCKED = true;

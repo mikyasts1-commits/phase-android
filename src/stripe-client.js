@@ -1,11 +1,14 @@
 /* ============================================================================
    STRIPE CLIENT — Stripe.js Elements in the WebView.
-   Test mode only. The publishable key is public by design (embedded in
-   the app); the secret key never leaves the backend. Card data goes
-   directly from Stripe's iframe to Stripe (SAQ-A eligible).
+   DISABLED: card funding is not available until live Stripe keys are
+   configured. The test publishable key below is inert — no UI in the app
+   currently calls loadStripeJs(). Do not re-enable without swapping in a
+   live pk_live_* key and completing the production payments checklist
+   (webhook verification, reconciliation, idempotency).
 ============================================================================ */
 
-// Stripe test publishable key (pk_test_*). Safe to embed — public by design.
+// Stripe test publishable key (pk_test_*). Inert until live keys are set.
+// Safe to embed — public by design.
 const PUBLISHABLE_KEY = "pk_test_51UJbhzFEpmvfWBe8Hxfgo7dllkC7u1FAtZndHpG26eKEII8iK1sPybtjktfjTcuNQPDMbQFGAO3aLc0XzFkWYCf100i8fGQamE";
 
 let stripePromise = null;

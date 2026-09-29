@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
-import { checkForUpdates, dismissUpdate, UpdateDialog } from "./update-check.jsx";
-import { MARKETPLACE_LOCKED, CRYPTO_FUNDING_LOCKED, GO_LIVE_LOCKED, DASHBOARD_LOCKED } from "./feature-flags.js";
+import { MARKETPLACE_LOCKED, CRYPTO_FUNDING_LOCKED, GO_LIVE_LOCKED } from "./feature-flags.js";
 import { generateWallet, restoreWallet, createSovereignChain } from "./sovereign-client.js";
-import { mountCardElement, confirmCardPayment } from "./stripe-client.js";
+// stripe-client.js is retained for the future live-Stripe integration;
+// card funding UI is currently disabled (see CardFundPanel).
 import { reportError } from "./sentry.js";
 
 /* ------------------------- Phase backend API client ------------------------- */
@@ -238,7 +238,7 @@ const fundingApi = {
     backendFetch(`/funding/btc/address?userId=${encodeURIComponent(userId)}`),
   getBtcBalance: (userId) =>
     backendFetch(`/funding/btc/balance?userId=${encodeURIComponent(userId)}`),
-  // Stripe card funding (test mode)
+  // Stripe card funding (currently disabled pending live keys)
   createStripeIntent: (userId, amountMinor, currency) =>
     backendFetch(`/stripe/payment-intents?userId=${encodeURIComponent(userId)}`, {
       method: "POST",
@@ -254,7 +254,7 @@ const fundingApi = {
 
 /* ============================================================================
    PHASE — Onchain settlement for human, creative, and soft-asset value
-   Single-file React prototype. Light-blue glass aesthetic, Φ as living mark.
+   Single-file React app. Light-blue glass aesthetic, Φ as living mark.
 ============================================================================ */
 
 /* ---------------------------------- DATA ---------------------------------- */
@@ -616,7 +616,7 @@ const NEWS_ITEMS = [
   },
 ];
 
-/* ------------------------- Phi guide brain (demo) ------------------------- */
+/* ------------------------- Phi guide brain ------------------------- */
 // Conversational mock brain for Phi, the in-app guide. Today it answers from
 // scripted knowledge; the live path is a single swap in queryPhiBrain() below:
 // POST the message history to /api/guide/chat on the Phase backend, which
@@ -1758,7 +1758,6 @@ function AppInner() {
     };
   }, [authUser]);
   const [showNews, setShowNews] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState(null); // GitHub release update offer
   const [phaseCoins, setPhaseCoins] = useState(0);
   const [currency, setCurrency] = useState("usd");
   const [assets, setAssets] = useState([]); // live directory — populated from the backend only
@@ -1842,18 +1841,6 @@ function AppInner() {
   // Dashboard gate lifted for now — show the full interface so we can see it.
   // Re-enable with: const dashboardUnlocked = cryptoFunded || hasIssuedCoin;
   const dashboardUnlocked = true;
-
-  // In-app update check — once per launch, silent unless a newer GitHub
-  // release exists and this version wasn't snoozed.
-  useEffect(() => {
-    let cancelled = false;
-    checkForUpdates().then((info) => {
-      if (!cancelled && info) setUpdateInfo(info);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
 
   // Net worth, computed once here so both the dashboard figure and the
@@ -2206,9 +2193,9 @@ function AppInner() {
                   <div className="feature-lock-mark">
                     <Icon name="lock" size={30} />
                   </div>
-                  <h3 className="feature-lock-title">Coin issuance opens after legal review</h3>
+                  <h3 className="feature-lock-title">Coin issuance opening soon</h3>
                   <p className="feature-lock-sub">
-                    We&apos;re completing the legal review of user-issued coins before anyone can list. Check back soon.
+                    Coin issuance will be available here soon. Check back soon.
                   </p>
                 </div>
               </div>
@@ -2301,16 +2288,6 @@ function AppInner() {
       )}
 
 
-      {updateInfo && (
-        <UpdateDialog
-          info={updateInfo}
-          onLater={() => {
-            dismissUpdate(updateInfo.version);
-            setUpdateInfo(null);
-          }}
-          onDownload={() => setUpdateInfo(null)}
-        />
-      )}
 
       <ChatbotLauncher
         open={chatOpen}
@@ -3972,178 +3949,18 @@ function BringYourOwnNetworkFlow({ onBack, onPublish }) {
 }
 
 /* ------------------------- Card funding (Stripe) ------------------------- */
-// Stripe.js Card Element flow: amount -> backend creates PaymentIntent ->
-// Stripe-hosted card input -> confirm -> webhook credits the ledger.
-// Test mode only.
+// Card funding is disabled until live Stripe keys are configured.
+// The test-mode Card Element flow was removed; this panel renders a
+// placeholder message instead of payment UI.
 
 function CardFundPanel({ onFunded }) {
-  const [amount, setAmount] = useState("25");
-  const [step, setStep] = useState("entry"); // entry | card | processing | success | error
-  const [error, setError] = useState(null);
-  const [credited, setCredited] = useState(null);
-  const [clientSecret, setClientSecret] = useState(null);
-  const [intentId, setIntentId] = useState(null);
-  const cardMountRef = useRef(null);
-  const cardRef = useRef(null);
-  const mountedRef = useRef(true);
-
-  useEffect(() => {
-    return () => {
-      mountedRef.current = false;
-      if (cardRef.current) {
-        try { cardRef.current.destroy(); } catch { /* noop */ }
-        cardRef.current = null;
-      }
-    };
-  }, []);
-
-  const amountMinor = Math.round(parseFloat(amount || "0") * 100);
-  const amountValid = Number.isFinite(amountMinor) && amountMinor >= 50 && amountMinor <= 99999999;
-
-  // Mount the Stripe Card Element when we reach the card step.
-  useEffect(() => {
-    if (step !== "card" || !cardMountRef.current || cardRef.current) return;
-    let cancelled = false;
-    mountCardElement(cardMountRef.current)
-      .then(({ card, destroy }) => {
-        if (cancelled) { destroy(); return; }
-        cardRef.current = { card, destroy };
-      })
-      .catch((e) => {
-        if (!mountedRef.current) return;
-        setError(e.message);
-        setStep("error");
-      });
-    return () => { cancelled = true; };
-  }, [step]);
-
-  const startCardStep = async () => {
-    if (!amountValid) return;
-    setStep("processing");
-    setError(null);
-    try {
-      const intent = await fundingApi.createStripeIntent(currentUserId(), amountMinor, "cad");
-      if (!intent.client_secret) throw new Error("No client secret from backend.");
-      if (!mountedRef.current) return;
-      setClientSecret(intent.client_secret);
-      setIntentId(intent.id);
-      setStep("card");
-    } catch (e) {
-      if (!mountedRef.current) return;
-      setError(e.message || "Couldn't start payment.");
-      setStep("error");
-    }
-  };
-
-  const payNow = async () => {
-    if (!cardRef.current) return;
-    setStep("processing");
-    setError(null);
-    try {
-      await confirmCardPayment(cardRef.current.card, clientSecret);
-      // Backend polls Stripe (webhook usually beats us; confirm is idempotent).
-      const conf = await fundingApi.confirmStripeIntent(intentId);
-      if (!mountedRef.current) return;
-      const cad = (amountMinor / 100).toFixed(2);
-      setCredited(cad);
-      setStep("success");
-      onFunded && onFunded("cad", cad, "Card deposit");
-    } catch (e) {
-      if (!mountedRef.current) return;
-      setError(e.message || "Payment failed.");
-      setStep("card");
-    }
-  };
-
-  const backToEntry = () => {
-    if (cardRef.current) {
-      try { cardRef.current.destroy(); } catch { /* noop */ }
-      cardRef.current = null;
-    }
-    setStep("entry");
-    setError(null);
-  };
-
   return (
     <div className="card-fund-panel">
-      {step === "entry" && (
-        <>
-          <p className="section-sub">
-            Top up your Phase balance instantly. Test mode — use card{" "}
-            <span className="mono">4242 4242 4242 4242</span>, any future expiry, any CVC.
-          </p>
-          <label className="field-label">Amount (CAD)</label>
-          <div className="amount-row">
-            <span className="amount-currency">$</span>
-            <input
-              className="amount-input"
-              type="number"
-              min="0.50"
-              step="0.01"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              placeholder="25.00"
-            />
-          </div>
-          {!amountValid && amount !== "" && (
-            <p className="field-hint field-error">Enter at least CA$0.50.</p>
-          )}
-          <button
-            className="btn btn-primary btn-large btn-full"
-            onClick={startCardStep}
-            disabled={!amountValid}
-          >
-            Continue — CA${amountValid ? (amountMinor / 100).toFixed(2) : "0.00"}
-          </button>
-          <p className="field-hint">Secured by Stripe. Test mode, no real charge.</p>
-        </>
-      )}
-
-      {step === "card" && (
-        <>
-          <h3>CA{(amountMinor / 100).toFixed(2)} — card details</h3>
-          <p className="section-sub">Card data goes straight to Stripe, never our servers.</p>
-          <label className="field-label">Card</label>
-          <div ref={cardMountRef} className="stripe-card-element" />
-          {error && <p className="field-hint field-error">{error}</p>}
-          <button className="btn btn-primary btn-large btn-full" onClick={payNow}>
-            Pay CA{(amountMinor / 100).toFixed(2)}
-          </button>
-          <button className="btn btn-ghost" onClick={backToEntry}>Back</button>
-        </>
-      )}
-
-      {step === "processing" && (
-        <div className="funding-processing">
-          <span className="spinner spinner-large" />
-          <h3>Processing…</h3>
-          <p className="section-sub">Talking to Stripe. Don&apos;t close.</p>
-        </div>
-      )}
-
-      {step === "success" && (
-        <div className="funding-done">
-          <div className="funding-done-icon">
-            <Icon name="check" size={22} />
-          </div>
-          <h3>CA${credited} added!</h3>
-          <p className="section-sub">Your Phase balance is updated.</p>
-          <button className="btn btn-primary" onClick={backToEntry}>
-            Add more
-          </button>
-        </div>
-      )}
-
-      {step === "error" && (
-        <div className="funding-processing">
-          <h3>Something went wrong</h3>
-          <p className="section-sub">{error}</p>
-          <button className="btn btn-secondary" onClick={backToEntry}>Try again</button>
-        </div>
-      )}
+      <p className="section-sub">Card funding is not available yet.</p>
     </div>
   );
 }
+
 
 function FundAccountModal({ onClose, onFund }) {
   const [method, setMethod] = useState("card"); // card | crypto
@@ -4842,7 +4659,7 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
             </div>
             <h3 className="market-lock-title">Marketplace opening soon</h3>
             <p className="market-lock-sub">
-              We're finishing the crypto funding rails — USDC and USDT deposits — before trading goes live.
+              Trading will be available here soon.
             </p>
           </div>
         </div>
@@ -5556,7 +5373,6 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
   const [amount, setAmount] = useState("");
   const [usePhase, setUsePhase] = useState(true);
   const [payCurrency, setPayCurrency] = useState("usd");
-  const [toppingUp, setToppingUp] = useState(false);
   // Sovereign pay method: "usd" (Trade USD, issuer gets paid) or "coin"
   // (offer units of your own issued coin in exchange).
   const [sovPay, setSovPay] = useState("usd");
@@ -5607,15 +5423,6 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
   const swapReceiveUnits =
     offerValueUsd > 0 && asset.price > 0 ? Math.floor(offerValueUsd / asset.price) : 0;
 
-  const handleTopup = async () => {
-    setToppingUp(true);
-    try {
-      await onTopup(1000);
-    } finally {
-      setToppingUp(false);
-    }
-  };
-
   const usdUnitsPreview =
     numericAmount > 0 && asset.price > 0 ? Math.floor(numericAmount / asset.price) : 0;
 
@@ -5658,14 +5465,9 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                   {" — "}your payment goes straight to the coin issuer.
                 </p>
                 {(tradeCashUsd || 0) < numericAmount && (
-                  <button
-                    className="pill-btn"
-                    style={{ marginTop: 6 }}
-                    disabled={toppingUp}
-                    onClick={handleTopup}
-                  >
-                    {toppingUp ? "Adding…" : "Add $1,000 test funds"}
-                  </button>
+                  <p className="field-hint field-error" style={{ marginTop: 6 }}>
+                    Insufficient trade USD balance. Fund your account to invest.
+                  </p>
                 )}
 
                 <label className="field-label">Amount (in USD)</label>
