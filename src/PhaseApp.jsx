@@ -179,6 +179,12 @@ const tradeApi = {
       body: { userId: currentUserId(), chainId, amountUsd, buyerAddress },
       idempotencyKey: idempotencyKey || `buy-${chainId}-${Date.now()}`,
     }),
+  // Server-authoritative pre-confirmation quote: gross, 80-bps fee, net.
+  // The client displays these values; settlement recomputes them server-side.
+  quote: (chainId, amountUsd) =>
+    backendFetch(
+      `/trades/quote?chainId=${encodeURIComponent(chainId)}&amountUsd=${encodeURIComponent(amountUsd)}`
+    ),
   balances: () => backendFetch(`/trades/balances?userId=${currentUserId()}`),
   history: (role = "seller") => backendFetch(`/trades/history?userId=${currentUserId()}&role=${role}`),
   topup: (amountUsd) =>
@@ -201,6 +207,52 @@ const marketApi = {
       body: { userId: currentUserId(), chainId: targetChainId, buyerAddress, offerChainId, offerUnits },
       idempotencyKey: idempotencyKey || `swap-${targetChainId}-${Date.now()}`,
     }),
+  // Server-authoritative swap quote: gross target units, fee units, net units.
+  swapQuote: (targetChainId, offerChainId, offerUnits) =>
+    backendFetch(
+      `/trades/swap-quote?chainId=${encodeURIComponent(targetChainId)}&offerChainId=${encodeURIComponent(offerChainId)}&offerUnits=${encodeURIComponent(offerUnits)}`
+    ),
+};
+
+// Admin API: fee config, treasury, withdrawals, reconciliation, system
+// checks, admin management. Every endpoint is admin-gated server-side;
+// adminApi.me() lets the client probe privilege without side effects.
+const adminApi = {
+  me: () => backendFetch("/admin/me"),
+  getFeeConfig: () => backendFetch("/admin/fees/config"),
+  setFeeConfig: (feeBps, reason) =>
+    backendFetch("/admin/fees/config", { method: "PUT", body: { feeBps, reason } }),
+  getSummary: (days = 30) =>
+    backendFetch(`/admin/fees/summary?days=${encodeURIComponent(days)}`),
+  getLedger: (limit = 50, offset = 0) =>
+    backendFetch(`/admin/fees/ledger?limit=${limit}&offset=${offset}`),
+  getTreasuryBalances: () => backendFetch("/admin/treasury/balances"),
+  requestWithdrawal: ({ assetSymbol, amount, destinationRef, provider = "manual" }) =>
+    backendFetch("/admin/treasury/withdrawals", {
+      method: "POST",
+      body: { assetSymbol, amount, destinationRef, provider },
+    }),
+  listWithdrawals: (status) =>
+    backendFetch(
+      `/admin/treasury/withdrawals${status ? `?status=${encodeURIComponent(status)}` : ""}`
+    ),
+  approveWithdrawal: (id) =>
+    backendFetch(`/admin/treasury/withdrawals/${encodeURIComponent(id)}/approve`, {
+      method: "POST",
+    }),
+  executeWithdrawal: (id, externalRef) =>
+    backendFetch(`/admin/treasury/withdrawals/${encodeURIComponent(id)}/execute`, {
+      method: "POST",
+      body: { externalRef },
+    }),
+  runReconciliation: () => backendFetch("/admin/reconciliation/run", { method: "POST" }),
+  latestReconciliation: () => backendFetch("/admin/reconciliation/latest"),
+  systemChecks: () => backendFetch("/admin/system/checks"),
+  listAdmins: () => backendFetch("/admin/users/admins"),
+  grantAdmin: (userId) =>
+    backendFetch(`/admin/users/${encodeURIComponent(userId)}/grant`, { method: "POST" }),
+  revokeAdmin: (userId) =>
+    backendFetch(`/admin/users/${encodeURIComponent(userId)}/revoke`, { method: "POST" }),
 };
 
 const socialApi = {  getProviders: () => backendFetch("/social/providers"),
@@ -1658,6 +1710,29 @@ function AppInner() {
   const [accountModal, setAccountModal] = useState(null);
   // Notice shown on the auth screen (e.g. after account deletion).
   const [authNotice, setAuthNotice] = useState(null);
+  // Admin privilege: probed once per login via /admin/me. Non-admins never
+  // see the admin dashboard entry point.
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [showAdmin, setShowAdmin] = useState(false);
+  useEffect(() => {
+    if (!authUser) {
+      setIsAdmin(false);
+      setShowAdmin(false);
+      return;
+    }
+    let cancelled = false;
+    adminApi
+      .me()
+      .then((r) => {
+        if (!cancelled) setIsAdmin(!!r.isAdmin);
+      })
+      .catch(() => {
+        if (!cancelled) setIsAdmin(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authUser]);
   // Welcoming splash: Phase mark on open, fades away quickly.
   useEffect(() => {
     const t = setTimeout(() => setShowSplash(false), 1400);
@@ -1979,6 +2054,7 @@ function AppInner() {
         });
         const units = Number(res.trade.units) || 0;
         const paidUsd = Number(res.trade.amountUsd) || 0;
+        const feeUsd = res.fee ? Number(res.fee.feeUsd) || 0 : 0;
         setHoldings((prev) => {
           const existing = prev.find((h) => h.assetId === asset.id);
           if (existing) {
@@ -1999,11 +2075,19 @@ function AppInner() {
             time: new Date(),
             type: "invest",
             txId: res.trade.txId,
+            kind: "buy",
+            feeBps: res.fee?.feeBps ?? null,
+            feeAmount: res.fee?.feeUsd ?? null,
+            netAmount: res.fee?.sellerReceivesUsd ?? null,
           },
           ...prev,
         ]);
         await refreshTradeBalances();
-        showToast(`Bought ${units} ${asset.ticker} — $${paidUsd.toFixed(2)} sent to the issuer`);
+        showToast(
+          `Bought ${units} ${asset.ticker} — $${paidUsd.toFixed(2)}${
+            feeUsd > 0 ? ` (incl. $${feeUsd.toFixed(2)} Phase fee)` : ""
+          }`
+        );
       } catch (e) {
         if (e.code === "insufficient_funds" || e.status === 402) {
           showToast("Not enough trade USD — fund your account and try again");
@@ -2089,9 +2173,13 @@ function AppInner() {
         buyerAddress: sovereignWallet.address,
       });
       const t = res.trade || {};
-      const gotUnits = Number(t.units) || 0;
+      // The buyer receives NET units (gross minus the Phase fee). Fall back
+      // to the gross trade units for older backends without fee data.
+      const gotUnits = Number(res.fee?.buyerReceivesUnits) || Number(t.units) || 0;
       const paidUnits = Number(t.offerUnits) || offerUnits;
       const valueUsd = Number(t.amountUsd) || 0;
+      const feeUnits = res.fee ? Number(res.fee.feeUnits) || 0 : 0;
+      const feeTicker = res.fee?.assetSymbol || asset.ticker;
       setHoldings((prev) => {
         const bump = (list, assetId, deltaUnits, usd) => {
           const existing = list.find((h) => h.assetId === assetId);
@@ -2118,10 +2206,19 @@ function AppInner() {
           time: new Date(),
           type: "swap",
           txId: res.targetTxId || t.txId,
+          kind: "swap",
+          feeBps: res.fee?.feeBps ?? null,
+          feeAmount: res.fee?.feeUnits ?? null,
+          feeTicker,
+          netAmount: res.fee?.buyerReceivesUnits ?? null,
         },
         ...prev,
       ]);
-      showToast(`Swapped ${paidUnits} ${offerCoin.ticker} → ${gotUnits} ${asset.ticker}`);
+      showToast(
+        `Swapped ${paidUnits} ${offerCoin.ticker} → ${gotUnits} ${asset.ticker}${
+          feeUnits > 0 ? ` (${feeUnits} ${feeTicker} Phase fee)` : ""
+        }`
+      );
     } catch (e) {
       showToast(e.message || "Swap failed — please try again");
     }
@@ -2252,6 +2349,8 @@ function AppInner() {
               liveFx={liveFx}
               netWorthHistory={netWorthHistory}
               netWorthUsd={netWorthUsd}
+              isAdmin={isAdmin}
+              onOpenAdmin={() => setShowAdmin(true)}
             />
           )
         )}
@@ -2260,6 +2359,10 @@ function AppInner() {
       <BottomUtilityBar onOpenNews={() => setShowNews(true)} />
 
       {showNews && <NewsDrawer onClose={() => setShowNews(false)} />}
+
+      {showAdmin && isAdmin && (
+        <AdminDashboardModal onClose={() => setShowAdmin(false)} showToast={showToast} />
+      )}
 
       {accountModal === "account" && (
         <AccountModal
@@ -4673,6 +4776,9 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
         <h2 className="section-title">Marketplace</h2>
         <CurrencyDropdown currency={currency} setCurrency={setCurrency} />
       </div>
+      <p className="field-hint market-fee-disclosure">
+        Phase charges 0.80% on applicable transactions.
+      </p>
 
       {/* Issuer search — every person who minted a coin on Phase, searchable.
           No list until you search: the directory is a search function. */}
@@ -5381,6 +5487,17 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
   const [offerBalances, setOfferBalances] = useState({});
   const [balancesLoading, setBalancesLoading] = useState(false);
 
+  // Server-authoritative 80-bps fee quotes. The client never computes fees —
+  // it only displays what the backend quotes; settlement recomputes them.
+  const [quote, setQuote] = useState(null); // buy quote
+  const [quoteLoading, setQuoteLoading] = useState(false);
+  const [quoteError, setQuoteError] = useState(null);
+  const quoteReqRef = useRef(0);
+  const [swapQuote, setSwapQuote] = useState(null); // swap quote
+  const [swapQuoteLoading, setSwapQuoteLoading] = useState(false);
+  const [swapQuoteError, setSwapQuoteError] = useState(null);
+  const swapQuoteReqRef = useRef(0);
+
   // Sovereign coins settle for real on the backend: buyer USD -> issuer USD
   // plus coins move on the coin's own chain — or a coin-for-coin swap.
   const isSovereign = asset.chainId && String(asset.chainId).startsWith("ch_");
@@ -5425,6 +5542,63 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
 
   const usdUnitsPreview =
     numericAmount > 0 && asset.price > 0 ? Math.floor(numericAmount / asset.price) : 0;
+
+  // Buy fee quote: debounced; stale responses are discarded via the counter.
+  useEffect(() => {
+    if (!isSovereign || sovPay !== "usd" || !(numericAmount > 0) || !asset.chainId) {
+      setQuote(null);
+      setQuoteError(null);
+      setQuoteLoading(false);
+      return;
+    }
+    setQuoteLoading(true);
+    setQuoteError(null);
+    const reqId = ++quoteReqRef.current;
+    const t = setTimeout(async () => {
+      try {
+        const res = await tradeApi.quote(asset.chainId, numericAmount);
+        if (quoteReqRef.current !== reqId) return;
+        setQuote(res.quote || null);
+      } catch (e) {
+        if (quoteReqRef.current !== reqId) return;
+        setQuote(null);
+        setQuoteError(e.message || "Couldn't fetch the fee quote");
+      } finally {
+        if (quoteReqRef.current === reqId) setQuoteLoading(false);
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [isSovereign, sovPay, numericAmount, asset.chainId]);
+
+  // Swap fee quote: debounced; stale responses are discarded via the counter.
+  // Depends on offerCoinId (stable string), not the offerCoin object identity.
+  useEffect(() => {
+    const oc = offerableCoins.find((c) => c.chainId === offerCoinId) || null;
+    if (!isSovereign || sovPay !== "coin" || !oc || !(numericOfferUnits > 0)) {
+      setSwapQuote(null);
+      setSwapQuoteError(null);
+      setSwapQuoteLoading(false);
+      return;
+    }
+    setSwapQuoteLoading(true);
+    setSwapQuoteError(null);
+    const reqId = ++swapQuoteReqRef.current;
+    const t = setTimeout(async () => {
+      try {
+        const res = await marketApi.swapQuote(asset.chainId, oc.chainId, numericOfferUnits);
+        if (swapQuoteReqRef.current !== reqId) return;
+        setSwapQuote(res.quote || null);
+      } catch (e) {
+        if (swapQuoteReqRef.current !== reqId) return;
+        setSwapQuote(null);
+        setSwapQuoteError(e.message || "Couldn't fetch the fee quote");
+      } finally {
+        if (swapQuoteReqRef.current === reqId) setSwapQuoteLoading(false);
+      }
+    }, 400);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSovereign, sovPay, offerCoinId, numericOfferUnits, asset.chainId]);
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -5489,18 +5663,53 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                   value={amount}
                   onChange={(e) => setAmount(e.target.value)}
                 />
-                {numericAmount > 0 && (
+                {numericAmount > 0 && !quote && !quoteLoading && !quoteError && (
                   <p className="field-hint">
                     You'll receive approximately {usdUnitsPreview} coins.
                   </p>
                 )}
+                {numericAmount > 0 && quoteLoading && (
+                  <p className="field-hint">Fetching fee quote…</p>
+                )}
+                {numericAmount > 0 && quoteError && (
+                  <p className="field-hint field-error" style={{ marginTop: 6 }}>
+                    {quoteError} — please try again.
+                  </p>
+                )}
+                {numericAmount > 0 && quote && (
+                  <div className="fee-breakdown glass-card">
+                    <div className="fee-row">
+                      <span>You pay</span>
+                      <strong>${Number(quote.grossUsd).toFixed(2)}</strong>
+                    </div>
+                    <div className="fee-row">
+                      <span>Phase fee ({(quote.feeBps / 100).toFixed(2)}%)</span>
+                      <strong>${Number(quote.feeUsd).toFixed(2)}</strong>
+                    </div>
+                    <p className="fee-note">
+                      Deducted from the seller's proceeds — you receive the full{" "}
+                      {Number(quote.units).toLocaleString()} {quote.ticker}.
+                    </p>
+                    <div className="fee-row fee-row-total">
+                      <span>You receive</span>
+                      <strong>
+                        {Number(quote.units).toLocaleString()} {quote.ticker}
+                      </strong>
+                    </div>
+                    <p className="fee-disclosure">
+                      Phase charges 0.80% on applicable transactions.
+                    </p>
+                  </div>
+                )}
 
                 <button
-                  className={`btn-primary btn-large btn-full ${numericAmount <= 0 ? "btn-disabled" : ""}`}
-                  disabled={numericAmount <= 0}
+                  className={`btn-primary btn-large btn-full ${
+                    numericAmount <= 0 || quoteLoading || !!quoteError ? "btn-disabled" : ""
+                  }`}
+                  disabled={numericAmount <= 0 || quoteLoading || !!quoteError}
                   onClick={() => onInvest(numericAmount, effectivePayId)}
                 >
-                  Invest Instantly
+                  {quote ? `Invest $${Number(quote.grossUsd).toFixed(2)}` : "Invest Instantly"}
                 </button>
               </>
             ) : offerableCoins.length === 0 ? (
@@ -5550,7 +5759,7 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                     Max
                   </button>
                 </div>
-                {offerCoin && numericOfferUnits > 0 && (
+                {offerCoin && numericOfferUnits > 0 && !swapQuote && !swapQuoteLoading && !swapQuoteError && (
                   <p className="field-hint">
                     Offer {numericOfferUnits.toLocaleString()} {offerCoin.ticker} (≈ $
                     {offerValueUsd.toFixed(2)}) → receive ≈ {swapReceiveUnits.toLocaleString()}{" "}
@@ -5559,15 +5768,61 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                       ` — you only hold ${offerBalance.toLocaleString()}.`}
                   </p>
                 )}
+                {offerCoin && numericOfferUnits > 0 && swapQuoteLoading && (
+                  <p className="field-hint">Fetching fee quote…</p>
+                )}
+                {offerCoin && numericOfferUnits > 0 && swapQuoteError && (
+                  <p className="field-hint field-error">{swapQuoteError} — please try again.</p>
+                )}
+                {offerCoin && numericOfferUnits > 0 && swapQuote && (
+                  <div className="fee-breakdown glass-card">
+                    <div className="fee-row">
+                      <span>You offer</span>
+                      <strong>
+                        {Number(swapQuote.offerUnits).toLocaleString()} {swapQuote.offerTicker}
+                      </strong>
+                    </div>
+                    <div className="fee-row">
+                      <span>Gross receive</span>
+                      <strong>
+                        {Number(swapQuote.grossUnits).toLocaleString()} {swapQuote.targetTicker}
+                      </strong>
+                    </div>
+                    <div className="fee-row">
+                      <span>Phase fee ({(swapQuote.feeBps / 100).toFixed(2)}%)</span>
+                      <strong>
+                        {Number(swapQuote.feeUnits).toLocaleString()} {swapQuote.targetTicker}
+                      </strong>
+                    </div>
+                    <div className="fee-row fee-row-total">
+                      <span>You receive</span>
+                      <strong>
+                        {Number(swapQuote.buyerReceivesUnits).toLocaleString()}{" "}
+                        {swapQuote.targetTicker}
+                      </strong>
+                    </div>
+                    <p className="fee-disclosure">
+                      Phase charges 0.80% on applicable transactions.
+                    </p>
+                  </div>
+                )}
 
                 <button
                   className={`btn-primary btn-large btn-full ${
-                    numericOfferUnits < 1 || numericOfferUnits > offerBalance || swapReceiveUnits < 1
+                    numericOfferUnits < 1 ||
+                    numericOfferUnits > offerBalance ||
+                    swapReceiveUnits < 1 ||
+                    swapQuoteLoading ||
+                    !!swapQuoteError
                       ? "btn-disabled"
                       : ""
                   }`}
                   disabled={
-                    numericOfferUnits < 1 || numericOfferUnits > offerBalance || swapReceiveUnits < 1
+                    numericOfferUnits < 1 ||
+                    numericOfferUnits > offerBalance ||
+                    swapReceiveUnits < 1 ||
+                    swapQuoteLoading ||
+                    !!swapQuoteError
                   }
                   onClick={() => onInvestSwap(offerCoin, numericOfferUnits)}
                 >
@@ -5659,6 +5914,647 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
   );
 }
 
+/* ============================== ADMIN DASHBOARD ================================ */
+// Admin-only: fee config, fee ledger, treasury, withdrawals, reconciliation,
+// production checks, admin management. Entry is gated by adminApi.me() in
+// AppInner — non-admins never see the button or this modal.
+
+function AdminDashboardModal({ onClose, showToast }) {
+  const [tab, setTab] = useState("fees");
+  const tabs = [
+    ["fees", "Fees"],
+    ["ledger", "Fee ledger"],
+    ["treasury", "Treasury"],
+    ["recon", "Reconciliation"],
+    ["system", "System"],
+    ["admins", "Admins"],
+  ];
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card admin-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="icon-btn modal-close" onClick={onClose}>
+          <Icon name="close" size={18} />
+        </button>
+        <h3>Phase Admin</h3>
+        <p className="section-sub">Fee engine, treasury, and reconciliation controls.</p>
+        <div className="platform-pills admin-tabs">
+          {tabs.map(([id, label]) => (
+            <button
+              key={id}
+              className={`pill-btn ${tab === id ? "pill-btn-active" : ""}`}
+              onClick={() => setTab(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {tab === "fees" && <AdminFeesTab showToast={showToast} />}
+        {tab === "ledger" && <AdminLedgerTab showToast={showToast} />}
+        {tab === "treasury" && <AdminTreasuryTab showToast={showToast} />}
+        {tab === "recon" && <AdminReconTab showToast={showToast} />}
+        {tab === "system" && <AdminSystemTab showToast={showToast} />}
+        {tab === "admins" && <AdminUsersTab showToast={showToast} />}
+      </div>
+    </div>
+  );
+}
+
+function AdminFeesTab({ showToast }) {
+  const [config, setConfig] = useState(null);
+  const [summary, setSummary] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [bps, setBps] = useState("");
+  const [reason, setReason] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [cfg, sum] = await Promise.all([
+        adminApi.getFeeConfig(),
+        adminApi.getSummary(30).catch(() => null),
+      ]);
+      setConfig(cfg.config || null);
+      setSummary(sum?.summary ?? null);
+      if (cfg.config) setBps(String(cfg.config.feeBps));
+    } catch (e) {
+      setError(e.message || "Couldn't load fee config");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const save = async () => {
+    const n = Number(bps);
+    if (!Number.isInteger(n) || n < 0 || n > 10000) {
+      showToast("Fee must be a whole number of basis points (0–10000)");
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await adminApi.setFeeConfig(n, reason || undefined);
+      setConfig(res.config || null);
+      showToast(`Fee rate updated to ${(n / 100).toFixed(2)}%`);
+      setReason("");
+    } catch (e) {
+      showToast(e.message || "Couldn't update the fee rate");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) return <p className="field-hint">Loading fee configuration…</p>;
+  if (error) return <p className="field-hint field-error">{error}</p>;
+  return (
+    <div className="admin-section">
+      <h4 className="subsection-title">Current rate</h4>
+      <div className="admin-kv">
+        <div className="fee-row">
+          <span>Rate</span>
+          <strong>{config ? `${(config.feeBps / 100).toFixed(2)}% (${config.feeBps} bps)` : "—"}</strong>
+        </div>
+        <div className="fee-row">
+          <span>Version</span>
+          <strong>{config?.version ?? "—"}</strong>
+        </div>
+        <div className="fee-row">
+          <span>Effective from</span>
+          <strong>{config?.effectiveFrom ? new Date(config.effectiveFrom).toLocaleString() : "—"}</strong>
+        </div>
+        <div className="fee-row">
+          <span>Last changed by</span>
+          <strong>{config?.createdBy || "—"}</strong>
+        </div>
+        {config?.reason && (
+          <div className="fee-row">
+            <span>Reason</span>
+            <strong>{config.reason}</strong>
+          </div>
+        )}
+      </div>
+      <h4 className="subsection-title">Change rate</h4>
+      <p className="field-hint">
+        Appends a new versioned rate — history is preserved and the change is audited. Applies to
+        new transactions only.
+      </p>
+      <div className="admin-form-row">
+        <input
+          className="text-input"
+          type="number"
+          min="0"
+          max="10000"
+          step="1"
+          placeholder="Basis points (e.g. 80)"
+          value={bps}
+          onChange={(e) => setBps(e.target.value)}
+        />
+        <input
+          className="text-input"
+          type="text"
+          placeholder="Reason (audited)"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+        />
+        <button className="btn-primary" disabled={saving} onClick={save}>
+          {saving ? "Saving…" : "Update rate"}
+        </button>
+      </div>
+      <h4 className="subsection-title">30-day summary</h4>
+      {summary ? (
+        <AdminSummaryView summary={summary} />
+      ) : (
+        <p className="field-hint">No summary data yet.</p>
+      )}
+    </div>
+  );
+}
+
+// Defensive renderer: the summary shape may evolve; show per-asset rows
+// when present, otherwise list top-level entries.
+function AdminSummaryView({ summary }) {
+  const rows = [];
+  const push = (label, value) => rows.push([label, value]);
+  if (summary && typeof summary === "object") {
+    const byAsset = summary.byAsset || summary.assets || summary.totals;
+    if (byAsset && typeof byAsset === "object") {
+      for (const [asset, v] of Object.entries(byAsset)) {
+        const val =
+          v && typeof v === "object"
+            ? Object.entries(v)
+                .map(([k, x]) => `${k}: ${x}`)
+                .join(" · ")
+            : String(v);
+        push(asset, val);
+      }
+    } else {
+      for (const [k, v] of Object.entries(summary)) {
+        if (v != null && typeof v !== "object") push(k, String(v));
+      }
+    }
+  }
+  if (rows.length === 0) return <p className="field-hint">No summary data yet.</p>;
+  return (
+    <div className="admin-kv">
+      {rows.map(([k, v]) => (
+        <div className="fee-row" key={k}>
+          <span>{k}</span>
+          <strong>{v}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AdminLedgerTab({ showToast }) {
+  const [fees, setFees] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await adminApi.getLedger(50, 0);
+        setFees(res.fees || []);
+      } catch (e) {
+        setError(e.message || "Couldn't load the fee ledger");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  if (loading) return <p className="field-hint">Loading fee ledger…</p>;
+  if (error) return <p className="field-hint field-error">{error}</p>;
+  if (fees.length === 0) return <p className="field-hint">No fee records yet.</p>;
+  return (
+    <div className="admin-table-wrap">
+      <table className="admin-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Type</th>
+            <th>Asset</th>
+            <th>Gross</th>
+            <th>Fee</th>
+            <th>Net</th>
+            <th>Rate</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {fees.map((f) => (
+            <tr key={f.feeId || f.idempotencyKey}>
+              <td>{f.createdAt ? new Date(f.createdAt).toLocaleString() : "—"}</td>
+              <td>{f.transactionType || "—"}</td>
+              <td>{f.assetSymbol || "—"}</td>
+              <td>{f.grossQuantity ?? "—"}</td>
+              <td>{f.feeQuantity ?? "—"}</td>
+              <td>{f.netQuantity ?? "—"}</td>
+              <td>{f.feeBps != null ? `${(f.feeBps / 100).toFixed(2)}%` : "—"}</td>
+              <td>
+                <span className={`status-chip status-${f.status || "unknown"}`}>{f.status || "—"}</span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AdminTreasuryTab({ showToast }) {
+  const [balances, setBalances] = useState([]);
+  const [withdrawals, setWithdrawals] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [assetSymbol, setAssetSymbol] = useState("USD");
+  const [amount, setAmount] = useState("");
+  const [destinationRef, setDestinationRef] = useState("");
+  const [requesting, setRequesting] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [b, w] = await Promise.all([
+        adminApi.getTreasuryBalances(),
+        adminApi.listWithdrawals().catch(() => ({ withdrawals: [] })),
+      ]);
+      setBalances(b.balances || []);
+      setWithdrawals(w.withdrawals || []);
+    } catch (e) {
+      setError(e.message || "Couldn't load treasury data");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const request = async () => {
+    if (!assetSymbol.trim() || !(Number(amount) > 0) || !destinationRef.trim()) {
+      showToast("Asset, amount, and destination reference are required");
+      return;
+    }
+    setRequesting(true);
+    try {
+      await adminApi.requestWithdrawal({
+        assetSymbol: assetSymbol.trim(),
+        amount: amount.trim(),
+        destinationRef: destinationRef.trim(),
+        provider: "manual",
+      });
+      showToast("Withdrawal requested — needs approval");
+      setAmount("");
+      setDestinationRef("");
+      await load();
+    } catch (e) {
+      showToast(e.message || "Couldn't request the withdrawal");
+    } finally {
+      setRequesting(false);
+    }
+  };
+
+  const approve = async (id) => {
+    try {
+      await adminApi.approveWithdrawal(id);
+      showToast("Withdrawal approved");
+      await load();
+    } catch (e) {
+      showToast(e.message || "Couldn't approve the withdrawal");
+    }
+  };
+
+  const execute = async (id) => {
+    const externalRef = window.prompt("External reference (bank/provider reference):", "");
+    if (externalRef == null) return;
+    try {
+      await adminApi.executeWithdrawal(id, externalRef || undefined);
+      showToast("Withdrawal executed");
+      await load();
+    } catch (e) {
+      showToast(e.message || "Couldn't execute the withdrawal");
+    }
+  };
+
+  if (loading) return <p className="field-hint">Loading treasury…</p>;
+  if (error) return <p className="field-hint field-error">{error}</p>;
+  return (
+    <div className="admin-section">
+      <h4 className="subsection-title">Balances</h4>
+      {balances.length === 0 ? (
+        <p className="field-hint">No treasury balances yet.</p>
+      ) : (
+        <div className="admin-kv">
+          {balances.map((b) => (
+            <div className="fee-row" key={`${b.accountId}:${b.assetSymbol}`}>
+              <span>{b.assetSymbol}</span>
+              <strong>{b.balance}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+      <h4 className="subsection-title">Request withdrawal</h4>
+      <p className="field-hint">
+        Withdrawals require a second step: approve, then execute with the provider reference.
+      </p>
+      <div className="admin-form-row">
+        <input
+          className="text-input"
+          type="text"
+          placeholder="Asset (e.g. USD)"
+          value={assetSymbol}
+          onChange={(e) => setAssetSymbol(e.target.value)}
+        />
+        <input
+          className="text-input"
+          type="text"
+          inputMode="decimal"
+          placeholder="Amount"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
+        />
+        <input
+          className="text-input"
+          type="text"
+          placeholder="Destination reference"
+          value={destinationRef}
+          onChange={(e) => setDestinationRef(e.target.value)}
+        />
+        <button className="btn-primary" disabled={requesting} onClick={request}>
+          {requesting ? "Requesting…" : "Request"}
+        </button>
+      </div>
+      <h4 className="subsection-title">Withdrawals</h4>
+      {withdrawals.length === 0 ? (
+        <p className="field-hint">No withdrawals yet.</p>
+      ) : (
+        <div className="admin-table-wrap">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Asset</th>
+                <th>Amount</th>
+                <th>Destination</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {withdrawals.map((w) => (
+                <tr key={w.id}>
+                  <td>{w.assetSymbol}</td>
+                  <td>{w.amount}</td>
+                  <td className="admin-wrap">{w.destinationRef}</td>
+                  <td>
+                    <span className={`status-chip status-${w.status}`}>{w.status}</span>
+                  </td>
+                  <td>
+                    {w.status === "requested" && (
+                      <button className="btn-secondary btn-small" onClick={() => approve(w.id)}>
+                        Approve
+                      </button>
+                    )}
+                    {w.status === "approved" && (
+                      <button className="btn-secondary btn-small" onClick={() => execute(w.id)}>
+                        Execute
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdminReconTab({ showToast }) {
+  const [run, setRun] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState(null);
+
+  const loadLatest = useCallback(async () => {
+    try {
+      const res = await adminApi.latestReconciliation();
+      setRun(res.run || null);
+    } catch (e) {
+      setError(e.message || "Couldn't load reconciliation status");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    loadLatest();
+  }, [loadLatest]);
+
+  const runNow = async () => {
+    setRunning(true);
+    try {
+      const res = await adminApi.runReconciliation();
+      setRun(res.result || null);
+      if (res.result && !res.result.invariantOk) {
+        showToast("Reconciliation found mismatches — review before any withdrawals");
+      } else {
+        showToast("Reconciliation complete — all invariants hold");
+      }
+    } catch (e) {
+      showToast(e.message || "Couldn't run reconciliation");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  if (loading) return <p className="field-hint">Loading reconciliation status…</p>;
+  if (error) return <p className="field-hint field-error">{error}</p>;
+  const assets = run?.assets || run?.totals?.assets || [];
+  return (
+    <div className="admin-section">
+      <button className="btn-primary" disabled={running} onClick={runNow}>
+        {running ? "Running…" : "Run reconciliation now"}
+      </button>
+      {run ? (
+        <>
+          <div className={`recon-banner ${run.invariantOk ? "recon-ok" : "recon-bad"}`}>
+            {run.invariantOk
+              ? "All invariants hold."
+              : "MISMATCH — discrepancies recorded, never auto-repaired. Investigate before any withdrawals."}
+          </div>
+          <p className="field-hint">
+            Run {run.runId != null ? `#${run.runId}` : ""} ·{" "}
+            {run.ranAt ? new Date(run.ranAt).toLocaleString() : "—"}
+          </p>
+          {assets.length > 0 && (
+            <div className="admin-table-wrap">
+              <table className="admin-table">
+                <thead>
+                  <tr>
+                    <th>Asset</th>
+                    <th>Collected</th>
+                    <th>Withdrawn</th>
+                    <th>Treasury</th>
+                    <th>Difference</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {assets.map((a) => (
+                    <tr key={a.assetSymbol}>
+                      <td>{a.assetSymbol}</td>
+                      <td>{a.collected}</td>
+                      <td>{a.withdrawn}</td>
+                      <td>{a.treasuryBalance}</td>
+                      <td>{a.difference}</td>
+                      <td>
+                        <span className={`status-chip ${a.ok ? "status-settled" : "status-bad"}`}>
+                          {a.ok ? "ok" : "mismatch"}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      ) : (
+        <p className="field-hint">No reconciliation runs yet.</p>
+      )}
+    </div>
+  );
+}
+
+function AdminSystemTab({ showToast }) {
+  const [checks, setChecks] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await adminApi.systemChecks();
+        setChecks(res.checks || []);
+      } catch (e) {
+        setError(e.message || "Couldn't load production checks");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  if (loading) return <p className="field-hint">Loading production checks…</p>;
+  if (error) return <p className="field-hint field-error">{error}</p>;
+  if (checks.length === 0) return <p className="field-hint">No checks reported.</p>;
+  return (
+    <div className="admin-section">
+      {checks.map((c) => (
+        <div className="fee-row" key={c.check}>
+          <span>
+            <span className={`check-dot ${c.ok ? "check-ok" : c.critical ? "check-critical" : "check-warn"}`} />
+            {c.check}
+            <span className="field-hint"> — {c.message}</span>
+          </span>
+          <strong>{c.ok ? "ok" : c.critical ? "CRITICAL" : "warn"}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AdminUsersTab({ showToast }) {
+  const [admins, setAdmins] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [userId, setUserId] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await adminApi.listAdmins();
+      setAdmins(res.admins || []);
+    } catch (e) {
+      setError(e.message || "Couldn't load admins");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const grant = async () => {
+    if (!userId.trim()) {
+      showToast("Enter a user id");
+      return;
+    }
+    try {
+      await adminApi.grantAdmin(userId.trim());
+      showToast("Admin granted");
+      setUserId("");
+      await load();
+    } catch (e) {
+      showToast(e.message || "Couldn't grant admin");
+    }
+  };
+  const revoke = async (id) => {
+    try {
+      await adminApi.revokeAdmin(id);
+      showToast("Admin revoked");
+      await load();
+    } catch (e) {
+      showToast(e.message || "Couldn't revoke admin");
+    }
+  };
+
+  if (loading) return <p className="field-hint">Loading admins…</p>;
+  if (error) return <p className="field-hint field-error">{error}</p>;
+  return (
+    <div className="admin-section">
+      <h4 className="subsection-title">Administrators</h4>
+      {admins.length === 0 ? (
+        <p className="field-hint">No flagged admins.</p>
+      ) : (
+        <div className="admin-kv">
+          {admins.map((a) => (
+            <div className="fee-row" key={a.userId}>
+              <span>
+                {a.name || a.email || a.userId}
+                {a.email && a.name ? ` (${a.email})` : ""}
+              </span>
+              <button className="btn-secondary btn-small" onClick={() => revoke(a.userId)}>
+                Revoke
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <h4 className="subsection-title">Grant admin</h4>
+      <div className="admin-form-row">
+        <input
+          className="text-input"
+          type="text"
+          placeholder="User id"
+          value={userId}
+          onChange={(e) => setUserId(e.target.value)}
+        />
+        <button className="btn-primary" onClick={grant}>
+          Grant
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ============================== DASHBOARD TAB ================================ */
 
 function DashboardTab({
@@ -5676,6 +6572,8 @@ function DashboardTab({
   liveFx,
   netWorthHistory,
   netWorthUsd,
+  isAdmin,
+  onOpenAdmin,
 }) {
   const [showFundModal, setShowFundModal] = useState(false);
 
@@ -5735,7 +6633,14 @@ function DashboardTab({
       <section className="glass-card net-worth-card">
         <div className="market-header">
           <h2 className="section-title">My Dashboard</h2>
-          <CurrencyDropdown currency={currency} setCurrency={setCurrency} />
+          <div className="dash-header-actions">
+            {isAdmin && (
+              <button className="btn-secondary btn-small" onClick={onOpenAdmin}>
+                Admin
+              </button>
+            )}
+            <CurrencyDropdown currency={currency} setCurrency={setCurrency} />
+          </div>
         </div>
         <span className="stat-label">Total Net Worth</span>
         <span className="net-worth-value">{formatCurrency(netWorthUsd, currency, liveFx)}</span>
@@ -5994,10 +6899,24 @@ function DashboardTab({
             {txHistory.slice(0, 8).map((tx) => (
               <div className="tx-row" key={tx.id}>
                 <span>
-                  {tx.type === "fund" ? "Funded account" : "Invested in"} <strong>{tx.assetName}</strong>
+                  {tx.type === "fund"
+                    ? "Funded account"
+                    : tx.kind === "swap"
+                      ? "Swapped"
+                      : "Invested in"}{" "}
+                  <strong>{tx.assetName}</strong>
                 </span>
-                <span className="stat-label">
-                  {formatCurrency(tx.amountUsd, tx.currency, liveFx)}
+                <span className="tx-amount-col">
+                  <span className="stat-label">
+                    {formatCurrency(tx.amountUsd, tx.currency, liveFx)}
+                  </span>
+                  {tx.feeBps != null && tx.feeAmount != null && (
+                    <span className="tx-fee-line">
+                      {tx.kind === "swap"
+                        ? `Fee ${(tx.feeBps / 100).toFixed(2)}% · ${Number(tx.feeAmount).toLocaleString()} ${tx.feeTicker || ""} · you received ${Number(tx.netAmount || 0).toLocaleString()} ${tx.feeTicker || ""}`
+                        : `Fee ${(tx.feeBps / 100).toFixed(2)}% · $${Number(tx.feeAmount).toFixed(2)} · seller received $${Number(tx.netAmount || 0).toFixed(2)}`}
+                    </span>
+                  )}
                 </span>
               </div>
             ))}
@@ -7341,6 +8260,46 @@ function GlobalStyles() {
 
       .tx-list { display: flex; flex-direction: column; gap: 8px; }
       .tx-row { display: flex; justify-content: space-between; font-size: 13px; padding: 8px 0; border-bottom: 1px solid rgba(14,165,233,0.07); }
+      .tx-amount-col { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+      .tx-fee-line { font-size: 11px; opacity: 0.6; text-align: right; }
+      .field-error { color: #b91c1c; opacity: 1; }
+      .btn-small { font-size: 12px; padding: 6px 12px; }
+
+      /* ---------------- Fee quotes & disclosure ---------------- */
+      .fee-breakdown { padding: 12px 14px; margin: 10px 0; }
+      .fee-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; padding: 5px 0; }
+      .fee-row span { opacity: 0.75; }
+      .fee-row strong { font-weight: 700; }
+      .fee-row-total { border-top: 1px solid rgba(14,165,233,0.12); margin-top: 4px; padding-top: 9px; font-size: 14px; }
+      .fee-note { font-size: 11.5px; opacity: 0.6; margin: 4px 0 0; }
+      .fee-disclosure { font-size: 11px; opacity: 0.55; margin: 8px 0 0; font-style: italic; }
+      .market-fee-disclosure { margin: 2px 0 10px; }
+      .dash-header-actions { display: flex; align-items: center; gap: 8px; }
+
+      /* ---------------- Admin dashboard ---------------- */
+      .admin-modal { max-width: 640px; width: calc(100vw - 32px); max-height: 88vh; overflow-y: auto; }
+      .admin-tabs { margin: 10px 0 4px; flex-wrap: wrap; }
+      .admin-section { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+      .admin-kv { display: flex; flex-direction: column; }
+      .admin-form-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 10px; }
+      .admin-form-row .text-input { flex: 1 1 120px; min-width: 0; }
+      .admin-table-wrap { overflow-x: auto; margin-top: 6px; }
+      .admin-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      .admin-table th, .admin-table td { text-align: left; padding: 7px 8px; border-bottom: 1px solid rgba(14,165,233,0.08); white-space: nowrap; }
+      .admin-table th { opacity: 0.6; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+      .admin-wrap { white-space: normal !important; word-break: break-word; max-width: 180px; }
+      .status-chip { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: rgba(14,165,233,0.12); color: var(--navy); }
+      .status-settled, .status-executed, .status-approved { background: rgba(34,197,94,0.14); color: #15803d; }
+      .status-reversed, .status-rejected, .status-failed { background: rgba(239,68,68,0.12); color: #b91c1c; }
+      .status-requested, .status-pending { background: rgba(245,158,11,0.16); color: #b45309; }
+      .status-bad { background: rgba(239,68,68,0.12); color: #b91c1c; }
+      .recon-banner { font-size: 13px; font-weight: 600; padding: 10px 12px; border-radius: 10px; margin: 10px 0 4px; }
+      .recon-ok { background: rgba(34,197,94,0.12); color: #15803d; }
+      .recon-bad { background: rgba(239,68,68,0.12); color: #b91c1c; }
+      .check-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; background: #94a3b8; }
+      .check-ok { background: #22c55e; }
+      .check-warn { background: #f59e0b; }
+      .check-critical { background: #ef4444; }
 
       .footnotes-card { display: flex; gap: 18px; flex-wrap: wrap; }
       .footnote-link { color: var(--sky-500); font-size: 13px; font-weight: 600; text-decoration: none; }
