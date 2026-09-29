@@ -2052,19 +2052,24 @@ function AppInner() {
           amountUsd,
           buyerAddress: sovereignWallet.address,
         });
-        const units = Number(res.trade.units) || 0;
+        // The Phase fee is denominated in the purchased asset: the buyer
+        // receives NET units (gross - fee). Paid USD is the full gross.
+        const netUnits = res.fee?.buyerReceivesUnits != null
+          ? Number(res.fee.buyerReceivesUnits)
+          : Number(res.trade.units) || 0;
         const paidUsd = Number(res.trade.amountUsd) || 0;
-        const feeUsd = res.fee ? Number(res.fee.feeUsd) || 0 : 0;
+        const feeUnits = res.fee ? Number(res.fee.feeUnits) || 0 : 0;
+        const feeTicker = res.fee?.assetSymbol ?? asset.ticker;
         setHoldings((prev) => {
           const existing = prev.find((h) => h.assetId === asset.id);
           if (existing) {
             return prev.map((h) =>
               h.assetId === asset.id
-                ? { ...h, units: h.units + units, costBasisUsd: h.costBasisUsd + paidUsd }
+                ? { ...h, units: h.units + netUnits, costBasisUsd: h.costBasisUsd + paidUsd }
                 : h
             );
           }
-          return [...prev, { assetId: asset.id, units, costBasisUsd: paidUsd }];
+          return [...prev, { assetId: asset.id, units: netUnits, costBasisUsd: paidUsd }];
         });
         setTxHistory((prev) => [
           {
@@ -2077,15 +2082,16 @@ function AppInner() {
             txId: res.trade.txId,
             kind: "buy",
             feeBps: res.fee?.feeBps ?? null,
-            feeAmount: res.fee?.feeUsd ?? null,
-            netAmount: res.fee?.sellerReceivesUsd ?? null,
+            feeAmount: res.fee?.feeUnits ?? null,
+            feeAssetSymbol: feeTicker,
+            netAmount: res.fee?.buyerReceivesUnits ?? null,
           },
           ...prev,
         ]);
         await refreshTradeBalances();
         showToast(
-          `Bought ${units} ${asset.ticker} — $${paidUsd.toFixed(2)}${
-            feeUsd > 0 ? ` (incl. $${feeUsd.toFixed(2)} Phase fee)` : ""
+          `Bought ${netUnits} ${asset.ticker} — $${paidUsd.toFixed(2)}${
+            feeUnits > 0 ? ` (incl. ${feeUnits} ${feeTicker} Phase fee)` : ""
           }`
         );
       } catch (e) {
@@ -5683,17 +5689,25 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                       <strong>${Number(quote.grossUsd).toFixed(2)}</strong>
                     </div>
                     <div className="fee-row">
+                      <span>Gross</span>
+                      <strong>
+                        {Number(quote.grossUnits).toLocaleString()} {quote.ticker}
+                      </strong>
+                    </div>
+                    <div className="fee-row">
                       <span>Phase fee ({(quote.feeBps / 100).toFixed(2)}%)</span>
-                      <strong>${Number(quote.feeUsd).toFixed(2)}</strong>
+                      <strong>
+                        {Number(quote.feeUnits).toLocaleString()} {quote.feeAssetSymbol ?? quote.ticker}
+                      </strong>
                     </div>
                     <p className="fee-note">
-                      Deducted from the seller's proceeds — you receive the full{" "}
-                      {Number(quote.units).toLocaleString()} {quote.ticker}.
+                      The fee is taken from the coins you receive — the seller
+                      gets the full ${Number(quote.grossUsd).toFixed(2)}.
                     </p>
                     <div className="fee-row fee-row-total">
                       <span>You receive</span>
                       <strong>
-                        {Number(quote.units).toLocaleString()} {quote.ticker}
+                        {Number(quote.buyerReceivesUnits).toLocaleString()} {quote.ticker}
                       </strong>
                     </div>
                     <p className="fee-disclosure">
@@ -6914,7 +6928,7 @@ function DashboardTab({
                     <span className="tx-fee-line">
                       {tx.kind === "swap"
                         ? `Fee ${(tx.feeBps / 100).toFixed(2)}% · ${Number(tx.feeAmount).toLocaleString()} ${tx.feeTicker || ""} · you received ${Number(tx.netAmount || 0).toLocaleString()} ${tx.feeTicker || ""}`
-                        : `Fee ${(tx.feeBps / 100).toFixed(2)}% · $${Number(tx.feeAmount).toFixed(2)} · seller received $${Number(tx.netAmount || 0).toFixed(2)}`}
+                        : `Fee ${(tx.feeBps / 100).toFixed(2)}% · ${Number(tx.feeAmount).toLocaleString()} ${tx.feeAssetSymbol || ""} · you received ${Number(tx.netAmount || 0).toLocaleString()} ${tx.feeAssetSymbol || ""}`}
                     </span>
                   )}
                 </span>
