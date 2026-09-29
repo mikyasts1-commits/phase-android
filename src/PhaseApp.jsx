@@ -30,6 +30,10 @@ const PHASE_USER_ID = phaseUserId();
 async function backendFetch(path, { method = "GET", body, idempotencyKey, retries = 3 } = {}) {
   const headers = { "Content-Type": "application/json" };
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  try {
+    const token = getAuthToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+  } catch {}
 
   // Render's free-tier instance spins down after idle and can take 50s+ to
   // wake back up (see Render's own dashboard warning). A cold-start request
@@ -65,6 +69,50 @@ async function backendFetch(path, { method = "GET", body, idempotencyKey, retrie
   }
 }
 
+/* ------------------------- Auth: real accounts ------------------------- */
+const AUTH_TOKEN_KEY = "phase_auth_token";
+const AUTH_USER_KEY = "phase_auth_user";
+function getAuthToken() {
+  try { return localStorage.getItem(AUTH_TOKEN_KEY); } catch { return null; }
+}
+function getAuthUser() {
+  try {
+    const raw = localStorage.getItem(AUTH_USER_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function setAuthSession(token, user) {
+  try {
+    localStorage.setItem(AUTH_TOKEN_KEY, token);
+    localStorage.setItem(AUTH_USER_KEY, JSON.stringify(user));
+  } catch {}
+  try { window.dispatchEvent(new CustomEvent("phase:auth-changed")); } catch {}
+}
+function clearAuthSession() {
+  try {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem(AUTH_USER_KEY);
+  } catch {}
+  try { window.dispatchEvent(new CustomEvent("phase:auth-changed")); } catch {}
+}
+function currentUserId() {
+  const u = getAuthUser();
+  return u && u.userId ? u.userId : PHASE_USER_ID;
+}
+function isLoggedIn() {
+  return !!getAuthToken();
+}
+const authApi = {
+  signup: (email, password, name) =>
+    backendFetch("/auth/signup", { method: "POST", body: { email, password, name } }),
+  login: (email, password) =>
+    backendFetch("/auth/login", { method: "POST", body: { email, password } }),
+  me: () => backendFetch("/auth/me"),
+  logout: async () => {
+    try { await backendFetch("/auth/logout", { method: "POST" }); } catch {}
+    clearAuthSession();
+  },
+};
 const issuanceApi = {
   createDraft: (draft) => backendFetch("/issuance/draft", { method: "POST", body: draft }),
   getAgreement: (draftId) =>
@@ -72,12 +120,12 @@ const issuanceApi = {
   signAgreement: (draftId, legalName, { issuerCategory = "individual", title = "" } = {}) =>
     backendFetch("/issuance/sign", {
       method: "POST",
-      body: { draftId, legalName, accepted: true, userId: PHASE_USER_ID, issuerCategory, title },
+      body: { draftId, legalName, accepted: true, userId: currentUserId(), issuerCategory, title },
     }),
   mint: (draftId, { meme = false, idempotencyKey, issuerAddress, totalShares } = {}) =>
     backendFetch("/issuance/mint", {
       method: "POST",
-      body: { draftId, meme, userId: PHASE_USER_ID, issuerAddress, totalShares },
+      body: { draftId, meme, userId: currentUserId(), issuerAddress, totalShares },
       idempotencyKey: idempotencyKey || `mint-${draftId}-${Date.now()}`,
     }),
 };
@@ -98,13 +146,13 @@ const tradeApi = {
   buy: (chainId, { amountUsd, buyerAddress, idempotencyKey } = {}) =>
     backendFetch("/trades/buy", {
       method: "POST",
-      body: { userId: PHASE_USER_ID, chainId, amountUsd, buyerAddress },
+      body: { userId: currentUserId(), chainId, amountUsd, buyerAddress },
       idempotencyKey: idempotencyKey || `buy-${chainId}-${Date.now()}`,
     }),
-  balances: () => backendFetch(`/trades/balances?userId=${PHASE_USER_ID}`),
-  history: (role = "seller") => backendFetch(`/trades/history?userId=${PHASE_USER_ID}&role=${role}`),
+  balances: () => backendFetch(`/trades/balances?userId=${currentUserId()}`),
+  history: (role = "seller") => backendFetch(`/trades/history?userId=${currentUserId()}&role=${role}`),
   topup: (amountUsd) =>
-    backendFetch("/trades/topup", { method: "POST", body: { userId: PHASE_USER_ID, amountUsd } }),
+    backendFetch("/trades/topup", { method: "POST", body: { userId: currentUserId(), amountUsd } }),
 };
 
 // Issuer directory + coin-for-coin swaps: the "issuers online" marketplace.
@@ -112,7 +160,7 @@ const tradeApi = {
 // POST /trades/swap offers units of your own coin in exchange for another's.
 const marketApi = {
   directory: () => backendFetch("/marketplace/coins"),
-  myCoins: () => backendFetch(`/issuance/coins?userId=${encodeURIComponent(PHASE_USER_ID)}`),
+  myCoins: () => backendFetch(`/issuance/coins?userId=${encodeURIComponent(currentUserId())}`),
   chainBalance: (chainId, address) =>
     backendFetch(
       `/sovereign/chains/${encodeURIComponent(chainId)}/balances/${encodeURIComponent(address)}`
@@ -120,7 +168,7 @@ const marketApi = {
   swap: (targetChainId, { offerChainId, offerUnits, buyerAddress, idempotencyKey } = {}) =>
     backendFetch("/trades/swap", {
       method: "POST",
-      body: { userId: PHASE_USER_ID, chainId: targetChainId, buyerAddress, offerChainId, offerUnits },
+      body: { userId: currentUserId(), chainId: targetChainId, buyerAddress, offerChainId, offerUnits },
       idempotencyKey: idempotencyKey || `swap-${targetChainId}-${Date.now()}`,
     }),
 };
@@ -887,42 +935,13 @@ function PhiMark({ size = 36, animated = true, onClick, title }) {
       }}
       className="phi-mark-btn"
     >
-      <svg
+      <img
+        src="logo.png"
         width={size}
         height={size}
-        viewBox="0 0 64 64"
-        fill="none"
-        className={animated && !reduceMotion ? "phi-mark phi-mark-animated" : "phi-mark"}
-      >
-        <defs>
-          <linearGradient id="phiStroke" x1="0" y1="0" x2="64" y2="64">
-            <stop offset="0%" stopColor="#0ea5e9" />
-            <stop offset="100%" stopColor="#8b5cf6" />
-          </linearGradient>
-        </defs>
-        {/* outer loop */}
-        <ellipse
-          className="phi-ring"
-          cx="32"
-          cy="34"
-          rx="17"
-          ry="20"
-          stroke="url(#phiStroke)"
-          strokeWidth="4.5"
-          fill="none"
-        />
-        {/* vertical settlement stroke */}
-        <line
-          className="phi-stroke"
-          x1="32"
-          y1="6"
-          x2="32"
-          y2="62"
-          stroke="url(#phiStroke)"
-          strokeWidth="4.5"
-          strokeLinecap="round"
-        />
-      </svg>
+        alt="Phase"
+        style={{ borderRadius: 8, objectFit: "contain" }}
+      />
     </button>
   );
 }
@@ -1412,14 +1431,154 @@ function Icon({ name, size = 18 }) {
    APP
 =========================================================================== */
 
+/* ------------------------- Auth screen ------------------------- */
+function AuthScreen({ onAuthSuccess, initialMode = "signup" }) {
+  const [mode, setMode] = useState(initialMode);
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    try {
+      const remembered = JSON.parse(localStorage.getItem("phase_remembered") || "null");
+      if (remembered && remembered.email && !email) {
+        setEmail(remembered.email);
+        if (remembered.name) setName(remembered.name);
+      }
+    } catch {}
+  }, []);
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(null);
+    const cleanEmail = email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      setError("Enter a valid email address.");
+      return;
+    }
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters.");
+      return;
+    }
+    if (mode === "signup" && !name.trim()) {
+      setError("Enter your name.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = mode === "signup"
+        ? await authApi.signup(cleanEmail, password, name.trim())
+        : await authApi.login(cleanEmail, password);
+      setAuthSession(res.token, { userId: res.userId, email: res.email, name: res.name });
+      try { localStorage.removeItem("phase_remembered"); } catch {}
+      onAuthSuccess({ userId: res.userId, email: res.email, name: res.name });
+    } catch (err) {
+      setError(err.message || "Something went wrong. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="auth-wrap">
+      <div className="glass-card auth-card">
+        <h2 className="section-title">{mode === "signup" ? "Create your account" : "Welcome back"}</h2>
+        <p className="section-sub">
+          {mode === "signup"
+            ? "Going live creates your Phase account. Your coins and balances follow this account across devices."
+            : "Log in to access your dashboard, marketplace, and issued coins."}
+        </p>
+        <form onSubmit={submit} className="auth-form">
+          {mode === "signup" && (
+            <label className="field">
+              <span className="field-label">Name</span>
+              <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name" autoComplete="name" />
+            </label>
+          )}
+          <label className="field">
+            <span className="field-label">Email</span>
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" />
+          </label>
+          <label className="field">
+            <span className="field-label">Password</span>
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={mode === "signup" ? "At least 8 characters" : "Your password"} autoComplete={mode === "signup" ? "new-password" : "current-password"} />
+          </label>
+          {error && <p className="auth-error">{error}</p>}
+          <button type="submit" className="btn-primary auth-submit" disabled={busy}>
+            {busy ? "Please wait…" : mode === "signup" ? "Sign up & continue" : "Log in"}
+          </button>
+        </form>
+        <button className="link-btn auth-switch" onClick={() => { setMode(mode === "signup" ? "login" : "signup"); setError(null); }}>
+          {mode === "signup" ? "Already have an account? Log in" : "New to Phase? Create an account"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState("golive"); // golive | market | dashboard
+  const [authUser, setAuthUser] = useState(() => getAuthUser());
+  const [authReady, setAuthReady] = useState(false);
   const isAndroid = useMemo(() => /Android/.test(navigator.userAgent || ""), []);
   const [showSplash, setShowSplash] = useState(true);
   // Welcoming splash: Phase mark on open, fades away quickly.
   useEffect(() => {
     const t = setTimeout(() => setShowSplash(false), 1400);
     return () => clearTimeout(t);
+  }, []);
+  // Fetch the user's real issued coins from the backend and merge them into
+  // the asset list as owned products.
+  const refreshMyCoins = useCallback(async () => {
+    if (!isLoggedIn()) return;
+    try {
+      const data = await marketApi.myCoins();
+      const coins = (data.coins || []).map((c) => ({
+        id: `coin-${c.mintAddress || c.chainId}`,
+        assetId: `coin-${c.mintAddress || c.chainId}`,
+        chainId: c.mintAddress || c.chainId,
+        name: c.name,
+        ticker: c.ticker,
+        category: c.category || "socialMedia",
+        subsection: c.subsection || "",
+        tagline: `${c.name} — your sovereign coin`,
+        price: Number(c.priceUsd) || 0,
+        prevPrice: Number(c.priceUsd) || 0,
+        totalMinted: c.totalShares || 0,
+        retainedShares: c.retainedShares || 0,
+        isOwner: true,
+        mine: true,
+        sovereignLive: true,
+      }));
+      setAssets((prev) => {
+        const filtered = prev.filter((a) => !a.id || !String(a.id).startsWith("coin-") || !a.isOwner);
+        const existingIds = new Set(filtered.map((a) => a.id));
+        const fresh = coins.filter((c) => !existingIds.has(c.id));
+        return [...filtered, ...fresh];
+      });
+    } catch (e) {
+      console.warn("my coins refresh failed", e);
+    }
+  }, []);
+  // Restore session on launch: if a token exists, validate it silently.
+  useEffect(() => {
+    (async () => {
+      try {
+        if (getAuthToken()) {
+          const me = await authApi.me();
+          setAuthSession(getAuthToken(), { userId: me.userId, email: me.email, name: me.name });
+          setAuthUser({ userId: me.userId, email: me.email, name: me.name });
+          refreshMyCoins();
+        }
+      } catch {
+        clearAuthSession();
+        setAuthUser(null);
+      } finally {
+        setAuthReady(true);
+      }
+    })();
+    const onAuthChanged = () => setAuthUser(getAuthUser());
+    window.addEventListener("phase:auth-changed", onAuthChanged);
+    return () => window.removeEventListener("phase:auth-changed", onAuthChanged);
   }, []);
   const [showNews, setShowNews] = useState(false);
   const [updateInfo, setUpdateInfo] = useState(null); // GitHub release update offer
@@ -1484,7 +1643,7 @@ export default function App() {
   // deposits land (or once the user mints their own coin).
   const refreshFundingStatus = useCallback(async () => {
     try {
-      const data = await fundingApi.getBalances(PHASE_USER_ID);
+      const data = await fundingApi.getBalances(currentUserId());
       const balances = data.balances || data || {};
       const total = Object.values(balances).reduce((sum, b) => {
         const credited = typeof b === "object" ? (b.credited || 0) : b;
@@ -1899,10 +2058,26 @@ export default function App() {
       <TopNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        authUser={authUser}
+        onLogout={async () => {
+          await authApi.logout();
+          setAuthUser(null);
+          setActiveTab("golive");
+        }}
       />
 
       <main className="app-main">
-        {activeTab === "golive" && (
+        {activeTab === "golive" && !authUser && authReady && (
+          <AuthScreen
+            onAuthSuccess={(u) => {
+              setAuthUser(u);
+              refreshTradeBalances();
+              refreshFundingStatus();
+              refreshMyCoins();
+            }}
+          />
+        )}
+        {activeTab === "golive" && authUser && (
           <div className={GO_LIVE_LOCKED ? "feature-gated" : undefined}>
             {GO_LIVE_LOCKED && (
               <div className="feature-lock-overlay">
@@ -1926,7 +2101,7 @@ export default function App() {
             </div>
           </div>
         )}
-        {activeTab === "market" && (
+        {activeTab === "market" && authUser && (
           <MarketplaceTab
             assets={assets}
             currency={currency}
@@ -1944,7 +2119,7 @@ export default function App() {
             }}
           />
         )}
-        {activeTab === "dashboard" && (
+        {activeTab === "dashboard" && authUser && (
           !dashboardUnlocked ? (
             <div className="dashboard-wrap">
               <div className="glass-card empty-state">
@@ -2028,12 +2203,19 @@ function SplashScreen() {
   );
 }
 
-function TopNav({ activeTab, setActiveTab }) {
+function TopNav({ activeTab, setActiveTab, authUser, onLogout }) {
   const tabs = [
     { id: "golive", label: "Go Live", icon: "directory" },
     { id: "dashboard", label: "Dashboard", icon: "dashboard" },
     { id: "market", label: "Marketplace", icon: "directory" },
   ];
+  const handleTab = (id) => {
+    if ((id === "dashboard" || id === "market") && !authUser) {
+      setActiveTab("golive");
+      return;
+    }
+    setActiveTab(id);
+  };
   return (
     <header className="top-nav">
       <div className="top-nav-left">
@@ -2045,13 +2227,19 @@ function TopNav({ activeTab, setActiveTab }) {
           <button
             key={t.id}
             className={`nav-tab ${activeTab === t.id ? "nav-tab-active" : ""}`}
-            onClick={() => setActiveTab(t.id)}
+            onClick={() => handleTab(t.id)}
           >
             {t.label}
           </button>
         ))}
       </nav>
-      <div className="top-nav-right" />
+      <div className="top-nav-right">
+        {authUser ? (
+          <button className="link-btn nav-logout" onClick={onLogout} title={authUser.email}>
+            Log out
+          </button>
+        ) : null}
+      </div>
     </header>
   );
 }
@@ -2778,7 +2966,7 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
     setError(null);
     try {
       const draft = await issuanceApi.createDraft({
-        userId: PHASE_USER_ID,
+        userId: currentUserId(),
         name: coin.name,
         ticker: coin.ticker,
         category: coin.category || "Creator",
@@ -2820,7 +3008,7 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
     try {
       const [prov, conns] = await Promise.all([
         socialApi.getProviders().catch(() => ({ providers: [] })),
-        socialApi.getConnections(PHASE_USER_ID).catch(() => ({ connections: [] })),
+        socialApi.getConnections(currentUserId()).catch(() => ({ connections: [] })),
       ]);
       setSocialProviders(prov.providers || []);
       setSocialConns(conns.connections || []);
@@ -2832,13 +3020,13 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
   const connectSocial = async (provider) => {
     setSocialLoading(true);
     try {
-      const { authorizeUrl } = await socialApi.getAuthorizeUrl(provider, PHASE_USER_ID);
+      const { authorizeUrl } = await socialApi.getAuthorizeUrl(provider, currentUserId());
       // Open OAuth in system browser; backend callback stores the connection.
       window.open(authorizeUrl, "_blank");
       // Poll for the new connection (user completes OAuth in browser)
       for (let i = 0; i < 20; i++) {
         await new Promise((r) => setTimeout(r, 3000));
-        const { connections } = await socialApi.getConnections(PHASE_USER_ID).catch(() => ({ connections: [] }));
+        const { connections } = await socialApi.getConnections(currentUserId()).catch(() => ({ connections: [] }));
         if (connections.some((c) => c.provider === provider)) {
           setSocialConns(connections);
           break;
@@ -2853,7 +3041,7 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
 
   const disconnectSocial = async (provider) => {
     try {
-      await socialApi.disconnect(provider, PHASE_USER_ID);
+      await socialApi.disconnect(provider, currentUserId());
       setSocialConns(socialConns.filter((c) => c.provider !== provider));
     } catch (e) {
       setError(e.message);
@@ -3194,7 +3382,7 @@ function IssuanceDoneScreen({ mintResult, coin, socialConns, onBack }) {
   const handleAnnounce = async () => {
     setAnnouncing(true);
     try {
-      const res = await socialApi.announce(PHASE_USER_ID, coin.name, coin.ticker, !!mintResult.isMeme);
+      const res = await socialApi.announce(currentUserId(), coin.name, coin.ticker, !!mintResult.isMeme);
       setCardUrl(res.cardUrl);
       setAnnounceResult(res.results);
     } catch (e) {
@@ -3582,7 +3770,7 @@ function CardFundPanel({ onFunded }) {
     setStep("processing");
     setError(null);
     try {
-      const intent = await fundingApi.createStripeIntent(PHASE_USER_ID, amountMinor, "cad");
+      const intent = await fundingApi.createStripeIntent(currentUserId(), amountMinor, "cad");
       if (!intent.client_secret) throw new Error("No client secret from backend.");
       if (!mountedRef.current) return;
       setClientSecret(intent.client_secret);
@@ -3755,16 +3943,16 @@ function FundAccountModal({ onClose, onFund }) {
     try {
       if (isBtcChain) {
         const [addr, bal] = await Promise.all([
-          fundingApi.getBtcAddress(PHASE_USER_ID),
-          fundingApi.getBtcBalance(PHASE_USER_ID).catch(() => null),
+          fundingApi.getBtcAddress(currentUserId()),
+          fundingApi.getBtcBalance(currentUserId()).catch(() => null),
         ]);
         if (!mountedRef.current) return;
         setDepositInfo({ addresses: { "BTC-TESTNET": addr.address }, defaultChain: "BTC-TESTNET", testnet: addr.testnet });
         setBalances(bal ? { totals: { BTC: { credited: bal.confirmedBtc, pending: bal.mempoolBtc } } } : null);
       } else {
         const [dep, bal] = await Promise.all([
-          fundingApi.getDepositInfo(PHASE_USER_ID),
-          fundingApi.getBalances(PHASE_USER_ID).catch(() => null),
+          fundingApi.getDepositInfo(currentUserId()),
+          fundingApi.getBalances(currentUserId()).catch(() => null),
         ]);
         if (!mountedRef.current) return;
         setDepositInfo(dep);
@@ -3808,7 +3996,7 @@ function FundAccountModal({ onClose, onFund }) {
     pollRef.current = setInterval(async () => {
       try {
         if (isBtcChain) {
-          const bal = await fundingApi.getBtcBalance(PHASE_USER_ID);
+          const bal = await fundingApi.getBtcBalance(currentUserId());
           if (!mountedRef.current) return;
           setPollCount((n) => n + 1);
           const credited = parseFloat(bal?.confirmedBtc || "0");
@@ -3821,7 +4009,7 @@ function FundAccountModal({ onClose, onFund }) {
           }
           return;
         }
-        const bal = await fundingApi.getBalances(PHASE_USER_ID);
+        const bal = await fundingApi.getBalances(currentUserId());
         if (!mountedRef.current) return;
         setBalances(bal);
         setPollCount((n) => n + 1);
@@ -4099,7 +4287,7 @@ function CategoryPicker({ counts, onPick }) {
 
 // Compact issuer id for display: first 6 chars of the per-install user id.
 const issuerTag = (userId) =>
-  userId === PHASE_USER_ID ? "You" : `Issuer ${String(userId || "").slice(0, 6)}…`;
+  userId === currentUserId() ? "You" : `Issuer ${String(userId || "").slice(0, 6)}…`;
 
 // One row in the issuer directory: online dot, identity, key numbers,
 // and Buy / Compare actions.
@@ -4311,7 +4499,7 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
         assetId: `coin-${c.chainId}`,
         price: Number(c.priceUsd) || 0,
         tagline: `${c.name} — sovereign coin`,
-        mine: c.issuerUserId === PHASE_USER_ID,
+        mine: c.issuerUserId === currentUserId(),
       }));
       setDirCoins(coins);
       setMyCoinList(
@@ -5956,6 +6144,19 @@ function GlobalStyles() {
 
       /* ---------------- Phi mark ---------------- */
       .phi-mark-btn:focus-visible { outline: 2px solid var(--sky-500); border-radius: 8px; }
+
+      /* ------------------------- Auth ------------------------- */
+      .auth-wrap { display: flex; justify-content: center; padding: 24px 16px; }
+      .auth-card { width: 100%; max-width: 420px; padding: 28px 24px; }
+      .auth-form { display: flex; flex-direction: column; gap: 14px; margin-top: 18px; }
+      .auth-form .field { display: flex; flex-direction: column; gap: 6px; }
+      .auth-form .field-label { font-size: 13px; font-weight: 600; color: var(--navy); }
+      .auth-form input { padding: 12px 14px; border: 1px solid #bae6fd; border-radius: 10px; font-size: 16px; font-family: inherit; background: #fff; color: var(--navy); }
+      .auth-form input:focus { outline: 2px solid var(--sky-500); border-color: var(--sky-500); }
+      .auth-error { color: var(--coral); font-size: 14px; margin: 0; }
+      .auth-submit { margin-top: 6px; width: 100%; }
+      .auth-switch { margin-top: 16px; width: 100%; text-align: center; }
+      .nav-logout { font-size: 14px; padding: 8px 12px; }
       .phi-mark { transition: filter 0.25s ease; }
       .phi-mark-btn:hover .phi-mark {
         filter: drop-shadow(0 0 8px rgba(14,165,233,0.6));
