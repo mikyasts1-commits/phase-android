@@ -1558,6 +1558,8 @@ export default function App() {
         prevPrice: Number(c.priceUsd) || 0,
         totalMinted: c.totalShares || 0,
         retainedShares: c.retainedShares || 0,
+        socialProfiles: c.socialProfiles || [],
+        websiteUrl: c.websiteUrl || null,
         isOwner: true,
         mine: true,
         sovereignLive: true,
@@ -1864,6 +1866,7 @@ export default function App() {
       engagement: form.engagement,
       socialUrl: form.socialUrl,
       socialProfiles: form.socialProfiles || [], // every linked social account; each renders clickable on the listing
+      websiteUrl: form.websiteUrl || null, // business/asset website; renders as a button on the listing
       verification: form.verification, // { status: 'verified'|'unverified', lookupFollowers, lookupEngagement }
       compliance: form.compliance, // { docFileName, licenseNumber, consented }
       equityPublic: form.equityPublic,
@@ -2349,6 +2352,8 @@ function GoLiveTab({ onPublish, issuerAddress }) {
   const [verifyState, setVerifyState] = useState("idle"); // idle | checking | verified | mismatch
   const [lookupResult, setLookupResult] = useState(null);
   const [socialProfiles, setSocialProfiles] = useState([]); // linked social accounts: [{ platform, url, followers, engagement, verified }]
+  const [websiteUrl, setWebsiteUrl] = useState(""); // business/asset website, shown on marketplace listing
+  const [showOptionalSocial, setShowOptionalSocial] = useState(false); // non-social categories can optionally link socials
   const [showTerms, setShowTerms] = useState(false);
   const [consented, setConsented] = useState(false);
   // Business attestation: when a business chain is provisioned without uploaded
@@ -2509,6 +2514,7 @@ function GoLiveTab({ onPublish, issuerAddress }) {
             subsection,
             tagline: tagline.trim(),
             socialProfiles,
+            websiteUrl: websiteUrl.trim() || null,
             verification: { status: "unverified", lookupFollowers: null, lookupEngagement: null },
             compliance: {
               docFileName: isMeme ? null : "Issuer Agreement (digitally signed)",
@@ -2710,6 +2716,100 @@ function GoLiveTab({ onPublish, issuerAddress }) {
             >
               + Add {platform} profile{socialProfiles.length > 0 ? " (another)" : ""}
             </button>
+          </>
+        )}
+
+        {/* Optional social linking for non-social categories — by choice, not required */}
+        {!ASSET_CATEGORIES[category].usesSocialProof && (
+          <div className="optional-social-block">
+            <button
+              className="link-btn optional-social-toggle"
+              onClick={() => setShowOptionalSocial(!showOptionalSocial)}
+            >
+              {showOptionalSocial ? "−" : "+"} Optionally link social profiles
+            </button>
+            {showOptionalSocial && (
+              <>
+                <label className="field-label">Social proof sync (optional)</label>
+                <div className="social-sync-row">
+                  <div className="platform-pills">
+                    {PLATFORMS.map((p) => (
+                      <button
+                        key={p}
+                        className={`pill-btn ${platform === p ? "pill-btn-active" : ""}`}
+                        onClick={() => {
+                          setPlatform(p);
+                          setVerifyState("idle");
+                        }}
+                      >
+                        {p}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <label className="field-label" htmlFor="social-url-optional">
+                  Link your {platform} profile (optional)
+                </label>
+                <div className="verify-row">
+                  <input
+                    id="social-url-optional"
+                    className="text-input"
+                    placeholder={`https://${platform.toLowerCase()}.com/yourprofile`}
+                    value={socialUrl}
+                    onChange={(e) => {
+                      setSocialUrl(e.target.value);
+                    }}
+                  />
+                </div>
+                {socialProfiles.length > 0 && (
+                  <div className="social-profiles-list">
+                    {socialProfiles.map((p, i) => (
+                      <div key={`${p.platform}-${i}`} className="social-profile-row">
+                        <span className="social-profile-platform">{p.platform}</span>
+                        <a
+                          href={p.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="social-profile-url"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {p.url.replace(/^https?:\/\//, "").slice(0, 34)}
+                        </a>
+                        <button className="icon-btn" onClick={() => removeSocialProfile(i)} title="Remove profile">
+                          <Icon name="close" size={13} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <button
+                  className={`btn-secondary social-add-btn ${socialUrl.trim().length < 5 ? "btn-disabled" : ""}`}
+                  onClick={addSocialProfile}
+                  disabled={socialUrl.trim().length < 5}
+                >
+                  + Add {platform} profile{socialProfiles.length > 0 ? " (another)" : ""}
+                </button>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Website URL for business and asset listings — shows on marketplace */}
+        {["business", "hardAsset", "financial"].includes(ASSET_CATEGORIES[category].complianceClass) && (
+          <>
+            <label className="field-label" htmlFor="website-url">
+              Website (optional)
+            </label>
+            <input
+              id="website-url"
+              className="text-input"
+              placeholder="https://yourbusiness.com"
+              value={websiteUrl}
+              onChange={(e) => setWebsiteUrl(e.target.value)}
+            />
+            <p className="field-hint">
+              Your website shows as a button on your marketplace listing so buyers can learn more.
+            </p>
           </>
         )}
 
@@ -3025,6 +3125,8 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
         valueThesis: coin.tagline,
         equityPublic: coin.equityPublic,
         equityRetained: coin.equityRetained,
+        socialProfiles: coin.socialProfiles || [],
+        websiteUrl: coin.websiteUrl || null,
         priceUsd: coin.startingPrice,
       });
       setDraftId(draft.draftId);
@@ -5104,6 +5206,40 @@ function AssetListRow({ asset, currency, liveFx, expanded, onRowClick, onInvest 
         <div className="asset-list-row-expanded-content">
           <p className="asset-tagline">{asset.tagline}</p>
 
+          {/* Prominent external link buttons: social media for creator coins, website for business/assets */}
+          {((asset.socialProfiles && asset.socialProfiles.length > 0) || asset.socialUrl || asset.websiteUrl) && (
+            <div className="asset-external-links">
+              {(asset.socialProfiles && asset.socialProfiles.length > 0
+                ? asset.socialProfiles
+                : asset.socialUrl
+                  ? [{ platform: asset.platform || "Social", url: asset.socialUrl }]
+                  : []
+              ).map((p, i) => (
+                <a
+                  key={`social-${p.platform}-${i}`}
+                  className="btn-external-link btn-social-link"
+                  href={p.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <Icon name="external" size={14} /> Visit {p.platform} Profile
+                </a>
+              ))}
+              {asset.websiteUrl && (
+                <a
+                  className="btn-external-link btn-website-link"
+                  href={asset.websiteUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <Icon name="external" size={14} /> Visit Website
+                </a>
+              )}
+            </div>
+          )}
+
           <div className="asset-badges-row">
             {isVerified && (
               <span className="badge badge-verified">
@@ -5115,23 +5251,6 @@ function AssetListRow({ asset, currency, liveFx, expanded, onRowClick, onInvest 
                 <Icon name="check" size={11} /> Documentation on File
               </span>
             )}
-            {(asset.socialProfiles && asset.socialProfiles.length > 0
-              ? asset.socialProfiles
-              : asset.socialUrl
-                ? [{ platform: asset.platform, url: asset.socialUrl }]
-                : []
-            ).map((p, i) => (
-              <a
-                key={`${p.platform}-${i}`}
-                className="badge badge-link"
-                href={p.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={(e) => e.stopPropagation()}
-              >
-                View {p.platform} Profile →
-              </a>
-            ))}
           </div>
 
           <div className="asset-card-stats">
@@ -6816,6 +6935,24 @@ function GlobalStyles() {
       .badge-compliant { background: rgba(139,92,246,0.13); color: var(--violet); }
       .badge-link { background: rgba(14,165,233,0.1); color: var(--sky-500); cursor: pointer; }
       .badge-link:hover { background: rgba(14,165,233,0.18); }
+
+      /* External link buttons on marketplace listings (social profiles, websites) */
+      .asset-external-links { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px; }
+      .btn-external-link {
+        display: inline-flex; align-items: center; gap: 7px;
+        padding: 9px 16px; border-radius: 10px; font-size: 14px; font-weight: 600;
+        text-decoration: none; cursor: pointer; border: none;
+        transition: transform 0.1s ease, opacity 0.15s ease;
+      }
+      .btn-external-link:active { transform: scale(0.97); }
+      .btn-social-link { background: linear-gradient(135deg, #0ea5e9, #6366f1); color: #fff; }
+      .btn-social-link:hover { opacity: 0.92; }
+      .btn-website-link { background: var(--surface-2); color: var(--ink); border: 1px solid var(--border); }
+      .btn-website-link:hover { background: var(--surface-3); }
+
+      /* Optional social section toggle on the mint form */
+      .optional-social-block { margin: 6px 0 4px; }
+      .optional-social-toggle { font-size: 14px; padding: 6px 0; }
 
       /* ---------------- Marketplace ---------------- */
       .market-wrap { display: flex; flex-direction: column; gap: 4px; }
