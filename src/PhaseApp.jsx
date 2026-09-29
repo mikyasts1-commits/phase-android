@@ -1435,6 +1435,14 @@ function Icon({ name, size = 18 }) {
           <path d="M20 3.5V8h-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       );
+    case "external":
+      return (
+        <svg {...common}>
+          <path d="M14 4h6v6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          <path d="M20 4L11 13" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+          <path d="M19 13.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      );
     default:
       return null;
   }
@@ -2415,8 +2423,13 @@ function GoLiveTab({ onPublish, issuerAddress }) {
   // Lock the current platform + URL into the linked-profiles list so an
   // issuer can attach several social accounts; each renders as a clickable
   // link on their live listing.
+  const normalizeUrl = (u) => {
+    const t = (u || "").trim();
+    if (!t) return t;
+    return /^https?:\/\//i.test(t) ? t : `https://${t}`;
+  };
   const addSocialProfile = () => {
-    const url = socialUrl.trim();
+    const url = normalizeUrl(socialUrl);
     if (url.length < 5) return;
     if (socialProfiles.some((p) => p.platform === platform && p.url === url)) return;
     setSocialProfiles((prev) => [
@@ -2502,6 +2515,8 @@ function GoLiveTab({ onPublish, issuerAddress }) {
           equityRetained,
           totalShares,
           startingPrice,
+          socialProfiles,
+          websiteUrl: normalizeUrl(websiteUrl) || null,
         }}
         issuerAddress={issuerAddress}
         onBack={() => setFlowStep("form")}
@@ -2514,7 +2529,7 @@ function GoLiveTab({ onPublish, issuerAddress }) {
             subsection,
             tagline: tagline.trim(),
             socialProfiles,
-            websiteUrl: websiteUrl.trim() || null,
+            websiteUrl: normalizeUrl(websiteUrl) || null,
             verification: { status: "unverified", lookupFollowers: null, lookupEngagement: null },
             compliance: {
               docFileName: isMeme ? null : "Issuer Agreement (digitally signed)",
