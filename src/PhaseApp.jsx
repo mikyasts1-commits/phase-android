@@ -72,6 +72,8 @@ async function backendFetch(path, { method = "GET", body, idempotencyKey, retrie
 /* ------------------------- Auth: real accounts ------------------------- */
 const AUTH_TOKEN_KEY = "phase_auth_token";
 const AUTH_USER_KEY = "phase_auth_user";
+// Bank-style session lock: log out after 10 minutes without interaction.
+const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 function getAuthToken() {
   try { return localStorage.getItem(AUTH_TOKEN_KEY); } catch { return null; }
 }
@@ -89,6 +91,17 @@ function setAuthSession(token, user) {
   try { window.dispatchEvent(new CustomEvent("phase:auth-changed")); } catch {}
 }
 function clearAuthSession() {
+  // Bank-app behavior: remember who signed in (name/email only — the
+  // password is never stored) so the next login is one tap + password.
+  try {
+    const u = getAuthUser();
+    if (u && (u.email || u.name)) {
+      localStorage.setItem(
+        "phase_remembered",
+        JSON.stringify({ email: u.email || "", name: u.name || "" })
+      );
+    }
+  } catch {}
   try {
     localStorage.removeItem(AUTH_TOKEN_KEY);
     localStorage.removeItem(AUTH_USER_KEY);
@@ -1580,6 +1593,44 @@ export default function App() {
     window.addEventListener("phase:auth-changed", onAuthChanged);
     return () => window.removeEventListener("phase:auth-changed", onAuthChanged);
   }, []);
+  // Bank-style inactivity lock: after INACTIVITY_TIMEOUT_MS with no
+  // interaction, the session is logged out automatically. Name/email are
+  // remembered (see clearAuthSession) so logging back in is quick; the
+  // password is never stored. Redirects to the Go Live login screen.
+  useEffect(() => {
+    if (!authUser) return;
+    let timer = null;
+    let lastActivity = Date.now();
+    const doLock = async () => {
+      await authApi.logout();
+      setAuthUser(null);
+      setActiveTab("golive");
+    };
+    const arm = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(doLock, INACTIVITY_TIMEOUT_MS);
+    };
+    const onActivity = () => {
+      lastActivity = Date.now();
+      arm();
+    };
+    // If the app was backgrounded longer than the timeout, lock on return.
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        if (Date.now() - lastActivity > INACTIVITY_TIMEOUT_MS) doLock();
+        else arm();
+      }
+    };
+    const events = ["mousedown", "keydown", "touchstart", "touchmove", "wheel", "scroll", "click"];
+    events.forEach((ev) => window.addEventListener(ev, onActivity, { passive: true }));
+    document.addEventListener("visibilitychange", onVisibility);
+    arm();
+    return () => {
+      if (timer) clearTimeout(timer);
+      events.forEach((ev) => window.removeEventListener(ev, onActivity));
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [authUser]);
   const [showNews, setShowNews] = useState(false);
   const [updateInfo, setUpdateInfo] = useState(null); // GitHub release update offer
   const [phaseCoins, setPhaseCoins] = useState(0);
