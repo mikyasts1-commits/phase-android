@@ -5721,6 +5721,7 @@ function DashboardTab({
         </div>
         <span className="stat-label">Total Net Worth</span>
         <span className="net-worth-value">{formatCurrency(netWorthUsd, currency, liveFx)}</span>
+        <p className="net-worth-disclaimer">On-chained value doesn't necessarily reflect the market.</p>
 
         <div className="net-worth-charts-row">
           <AllocationDonut
@@ -7156,6 +7157,7 @@ function GlobalStyles() {
       /* ---------------- Dashboard ---------------- */
       .dashboard-wrap { display: flex; flex-direction: column; gap: 18px; }
       .net-worth-value { font-family: 'IBM Plex Mono'; font-size: 34px; font-weight: 700; color: var(--sky-500); display: block; margin: 4px 0 16px; }
+      .net-worth-disclaimer { font-size: 12px; color: var(--muted, #8a8f98); margin: -8px 0 16px; font-style: italic; }
 
       .dash-section-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
 
