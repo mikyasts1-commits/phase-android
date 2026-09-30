@@ -4065,59 +4065,51 @@ function BringYourOwnNetworkFlow({ onBack, onPublish }) {
 
 function CardFundPanel({ onFunded }) {
   const [amount, setAmount] = useState("");
-  // checking -> mounting -> ready -> processing -> success
+  // checking -> ready -> processing -> success
   // (unavailable when the backend reports Stripe is not live)
   const [status, setStatus] = useState("checking");
   const [error, setError] = useState(null);
+  // Single persistent mount node: the Card Element is mounted once and never
+  // moved. (An earlier version swapped the container when status changed,
+  // which destroyed the mounted element.)
   const [mountNode, setMountNode] = useState(null);
   const cardRef = useRef(null);
 
-  // 1. Ask the backend whether live card funding is configured.
+  // Mount once: verify live card funding with the backend, then attach the
+  // Stripe Card Element to the persistent container.
   useEffect(() => {
+    if (!mountNode || cardRef.current) return;
     let dead = false;
     (async () => {
       try {
         const s = await backendFetch("/stripe/status", { retries: 1 });
-        if (!dead) setStatus(s.configured && s.livemode ? "mounting" : "unavailable");
+        if (dead) return;
+        if (!(s.configured && s.livemode)) {
+          setStatus("unavailable");
+          return;
+        }
+        const h = await mountCardElement(mountNode);
+        if (dead) {
+          h.destroy();
+          return;
+        }
+        cardRef.current = h;
+        setStatus("ready");
       } catch (e) {
         if (!dead) {
-          setError("Couldn't reach Phase's servers — please try again in a moment.");
+          setError(e.message || "Card entry failed to load.");
           setStatus("unavailable");
         }
       }
     })();
     return () => {
       dead = true;
-    };
-  }, []);
-
-  // 2. Mount the Stripe Card Element once its container exists.
-  useEffect(() => {
-    if (status !== "mounting" || !mountNode || cardRef.current) return;
-    let dead = false;
-    let handle = null;
-    mountCardElement(mountNode)
-      .then((h) => {
-        if (dead) {
-          h.destroy();
-          return;
-        }
-        handle = h;
-        cardRef.current = h;
-        setStatus("ready");
-      })
-      .catch((e) => {
-        setError(e.message || "Card entry failed to load.");
-        setStatus("unavailable");
-      });
-    return () => {
-      dead = true;
       try {
-        handle && handle.destroy();
+        cardRef.current && cardRef.current.destroy();
       } catch {}
-      if (cardRef.current === handle) cardRef.current = null;
+      cardRef.current = null;
     };
-  }, [status, mountNode]);
+  }, [mountNode]);
 
   const cents = Math.round(Number(amount) * 100);
 
@@ -4148,19 +4140,9 @@ function CardFundPanel({ onFunded }) {
     }
   };
 
-  if (status === "checking" || status === "mounting") {
-    return (
-      <div className="card-fund-panel">
-        <div className="funding-processing">
-          <span className="spinner spinner-large" />
-          <p className="section-sub">Loading secure card payments…</p>
-        </div>
-        {/* Mount target exists before it is shown so Stripe can attach. */}
-        <div ref={setMountNode} className="stripe-card-element" style={{ display: "none" }} />
-      </div>
-    );
-  }
-
+  // Note: "checking", "ready" and "processing" all render this same branch so
+  // the Card Element's container is never unmounted/remounted (remounting
+  // destroys the Stripe element).
   if (status === "unavailable") {
     return (
       <div className="card-fund-panel">
@@ -4184,8 +4166,15 @@ function CardFundPanel({ onFunded }) {
     );
   }
 
+  const loading = status === "checking";
   return (
     <div className="card-fund-panel">
+      {loading && (
+        <div className="funding-processing">
+          <span className="spinner spinner-large" />
+          <p className="section-sub">Loading secure card payments…</p>
+        </div>
+      )}
       <label className="field-label" htmlFor="card-fund-amount">
         Amount (CAD)
       </label>
@@ -4198,7 +4187,7 @@ function CardFundPanel({ onFunded }) {
           placeholder="25.00"
           value={amount}
           onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, ""))}
-          disabled={status === "processing"}
+          disabled={loading || status === "processing"}
         />
       </div>
       <label className="field-label">Card details</label>
@@ -4207,7 +4196,7 @@ function CardFundPanel({ onFunded }) {
       <button
         className={`btn-primary btn-large btn-full ${status === "processing" ? "btn-disabled" : ""}`}
         onClick={fund}
-        disabled={status === "processing"}
+        disabled={loading || status === "processing"}
       >
         {status === "processing"
           ? "Processing…"
