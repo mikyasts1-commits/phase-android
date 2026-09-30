@@ -208,10 +208,42 @@ const marketApi = {
       idempotencyKey: idempotencyKey || `swap-${targetChainId}-${Date.now()}`,
     }),
   // Server-authoritative swap quote: gross target units, fee units, net units.
-  swapQuote: (targetChainId, offerChainId, offerUnits) =>
-    backendFetch(
-      `/trades/swap-quote?chainId=${encodeURIComponent(targetChainId)}&offerChainId=${encodeURIComponent(offerChainId)}&offerUnits=${encodeURIComponent(offerUnits)}`
-    ),
+  // Pass exactly one of offerUnits (forward quote) or requestUnits
+  // (inverse quote: how many to offer for the requested net target units).
+  swapQuote: (targetChainId, offerChainId, { offerUnits, requestUnits } = {}) => {
+    const q = new URLSearchParams({
+      chainId: targetChainId,
+      offerChainId,
+      ...(offerUnits != null ? { offerUnits: String(offerUnits) } : {}),
+      ...(requestUnits != null ? { requestUnits: String(requestUnits) } : {}),
+    });
+    return backendFetch(`/trades/swap-quote?${q.toString()}`);
+  },
+  // Swap offers: propose a coin-for-coin exchange. The recipient sees it in
+  // their dashboard inbox and can accept, counter, or decline. Nothing moves
+  // until they accept.
+  createOffer: (targetChainId, { offerChainId, offerUnits, requestUnits, buyerAddress, idempotencyKey } = {}) =>
+    backendFetch("/offers", {
+      method: "POST",
+      body: {
+        userId: currentUserId(),
+        targetChainId,
+        offerChainId,
+        offerUnits,
+        requestUnits,
+        buyerAddress,
+      },
+      idempotencyKey: idempotencyKey || `offer-${targetChainId}-${Date.now()}`,
+    }),
+  offerInbox: () => backendFetch("/offers/inbox"),
+  offerOutbox: () => backendFetch("/offers/outbox"),
+  acceptOffer: (offerId) => backendFetch(`/offers/${encodeURIComponent(offerId)}/accept`, { method: "POST", body: { userId: currentUserId() } }),
+  counterOffer: (offerId, { offerUnits, requestUnits }) =>
+    backendFetch(`/offers/${encodeURIComponent(offerId)}/counter`, {
+      method: "POST",
+      body: { userId: currentUserId(), offerUnits, requestUnits },
+    }),
+  declineOffer: (offerId) => backendFetch(`/offers/${encodeURIComponent(offerId)}/decline`, { method: "POST", body: { userId: currentUserId() } }),
 };
 
 // Admin API: fee config, treasury, withdrawals, reconciliation, system
@@ -1762,6 +1794,13 @@ function AppInner() {
         isOwner: true,
         mine: true,
         sovereignLive: true,
+        // Live position data from the backend: the issuer's real on-chain
+        // balance and how much of the public float has actually been bought.
+        // availableUnits replaces retainedShares wherever a real number exists.
+        availableUnits: c.availableUnits != null ? Number(c.availableUnits) : null,
+        realizationRatio: typeof c.realizationRatio === "number" ? c.realizationRatio : null,
+        publicFloatUnits: c.publicFloatUnits != null ? Number(c.publicFloatUnits) : null,
+        publicFloatSoldUnits: c.publicFloatSoldUnits != null ? Number(c.publicFloatSoldUnits) : null,
       }));
       setAssets((prev) => {
         const filtered = prev.filter((a) => !a.id || !String(a.id).startsWith("coin-") || !a.isOwner);
@@ -1794,6 +1833,45 @@ function AppInner() {
     window.addEventListener("phase:auth-changed", onAuthChanged);
     return () => window.removeEventListener("phase:auth-changed", onAuthChanged);
   }, []);
+  // Swap offers inbox/outbox: refreshed whenever the Dashboard opens.
+  const [offerInbox, setOfferInbox] = useState([]);
+  const [offerOutbox, setOfferOutbox] = useState([]);
+  const refreshOffers = useCallback(async () => {
+    if (!isLoggedIn()) return;
+    try {
+      const [inbox, outbox] = await Promise.all([
+        marketApi.offerInbox().catch(() => ({ offers: [] })),
+        marketApi.offerOutbox().catch(() => ({ offers: [] })),
+      ]);
+      setOfferInbox(inbox.offers || []);
+      setOfferOutbox(outbox.offers || []);
+    } catch (e) {
+      console.warn("offers refresh failed", e);
+    }
+  }, []);
+  // Offer actions: accept / counter / decline, then refresh everything.
+  const handleOfferAction = useCallback(async (action, offerId, counter) => {
+    try {
+      if (action === "accept") await marketApi.acceptOffer(offerId);
+      else if (action === "decline") await marketApi.declineOffer(offerId);
+      else if (action === "counter") await marketApi.counterOffer(offerId, counter);
+      showToast(
+        action === "accept" ? "Offer accepted — swap settled" :
+        action === "decline" ? "Offer declined" : "Counter-offer sent"
+      );
+      await Promise.all([refreshOffers(), refreshMyCoins(), refreshTradeBalances()]);
+    } catch (e) {
+      showToast(e.message || "Couldn't update the offer — please try again");
+    }
+  }, [refreshOffers, refreshMyCoins]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Refresh issued coins whenever the Dashboard opens, so "My Onchained
+  // Products" and the soft net worth always reflect the backend.
+  useEffect(() => {
+    if (activeTab === "dashboard" && authUser) {
+      refreshMyCoins();
+      refreshOffers();
+    }
+  }, [activeTab, authUser]); // eslint-disable-line react-hooks/exhaustive-deps
   // Bank-style inactivity lock: after INACTIVITY_TIMEOUT_MS with no
   // interaction, the session is logged out automatically. Name/email are
   // remembered (see clearAuthSession) so logging back in is quick; the
@@ -1925,9 +2003,17 @@ function AppInner() {
       const asset = assets.find((a) => a.id === h.assetId);
       return asset ? sum + h.units * asset.price : sum;
     }, 0);
+    // Soft net worth: your issued stake is valued at the listing price using
+    // your REAL on-chain balance (availableUnits) — not the original
+    // retained allocation. It only becomes real as buyers purchase coins.
     const ownedProductsUsd = assets
       .filter((a) => a.isOwner)
-      .reduce((sum, a) => sum + a.price * (a.retainedShares != null ? a.retainedShares : a.equityRetained), 0);
+      .reduce((sum, a) => {
+        const stake = a.availableUnits != null
+          ? a.availableUnits
+          : (a.retainedShares != null ? a.retainedShares : a.equityRetained);
+        return sum + a.price * stake;
+      }, 0);
     const cashUsd = Object.entries(cashBalances).reduce((sum, [id, amt]) => {
       const rate = liveFx[id] != null ? liveFx[id] : BASE_FX[id] || 1;
       return sum + amt / rate;
@@ -1957,11 +2043,15 @@ function AppInner() {
     // Create a real sovereign chain on the backend. There is no local-only
     // fallback: if the backend is unreachable, issuance fails loudly and
     // nothing is created.
-    if (!sovereignWallet) {
+    //
+    // If the coin was already minted through the issuance flow, its
+    // mintAddress is the authoritative chain — never create a second chain.
+    if (!sovereignWallet && !form.mintAddress) {
       showToast("Issuance failed: wallet not ready. Your asset was NOT created. Please try again.");
       return null;
     }
-    let sovereignChainId;
+    let sovereignChainId = form.mintAddress || null;
+    if (!sovereignChainId) {
     try {
       showToast("Creating your sovereign chain...");
       const res = await createSovereignChain({
@@ -1982,8 +2072,11 @@ function AppInner() {
       showToast("Issuance failed: could not reach the server. Your asset was NOT created. Please try again.");
       return null;
     }
+    }
     const newAsset = {
-      id: uid(),
+      // Use the backend coin id scheme when this asset came from a real mint,
+      // so the dashboard refresh merges instead of duplicating it.
+      id: form.mintAddress ? `coin-${form.mintAddress}` : uid(),
       name: form.name,
       ticker: generatedTicker,
       category: form.category,
@@ -2029,6 +2122,9 @@ function AppInner() {
     showToast(`${form.name} is live on its sovereign chain`);
     setHasIssuedCoin(true);
     setActiveTab("market");
+    // Pull the authoritative backend coin so "My Onchained Products" shows
+    // the real minted asset (no duplicates — ids match the backend scheme).
+    refreshMyCoins();
     return newAsset;
   };
 
@@ -2157,72 +2253,25 @@ function AppInner() {
 
   // Coin-for-coin swap: offer units of your own issued coin in exchange for
   // another issuer's coin. Settles on both sovereign chains via the backend.
-  const investSwap = async (asset, offerCoin, offerUnits) => {
+  // Swap offers: proposing a coin-for-coin exchange creates a pending offer
+  // for the target coin's issuer. They see it in their dashboard inbox and
+  // can accept, counter, or decline. Nothing moves until they accept.
+  const investSwap = async (asset, offerCoin, offerUnits, requestUnits) => {
     if (offerUnits < 1) return;
-    setAssets((prev) => {
-      let next = prev;
-      for (const a of [asset, offerCoin]) {
-        if (a && !next.some((x) => x.id === a.id)) next = [...next, a];
-      }
-      return next;
-    });
     if (!sovereignWallet?.address) {
       showToast("Your Phase wallet isn't ready yet — try again in a moment");
       return;
     }
     try {
-      const res = await marketApi.swap(asset.chainId, {
+      await marketApi.createOffer(asset.chainId, {
         offerChainId: offerCoin.chainId,
         offerUnits,
+        requestUnits: requestUnits > 0 ? requestUnits : undefined,
         buyerAddress: sovereignWallet.address,
       });
-      const t = res.trade || {};
-      // The buyer receives NET units (gross minus the Phase fee). Fall back
-      // to the gross trade units for older backends without fee data.
-      const gotUnits = Number(res.fee?.buyerReceivesUnits) || Number(t.units) || 0;
-      const paidUnits = Number(t.offerUnits) || offerUnits;
-      const valueUsd = Number(t.amountUsd) || 0;
-      const feeUnits = res.fee ? Number(res.fee.feeUnits) || 0 : 0;
-      const feeTicker = res.fee?.assetSymbol || asset.ticker;
-      setHoldings((prev) => {
-        const bump = (list, assetId, deltaUnits, usd) => {
-          const existing = list.find((h) => h.assetId === assetId);
-          if (existing) {
-            return list.map((h) =>
-              h.assetId === assetId
-                ? { ...h, units: Math.max(0, h.units + deltaUnits), costBasisUsd: h.costBasisUsd + usd }
-                : h
-            );
-          }
-          if (deltaUnits <= 0) return list;
-          return [...list, { assetId, units: deltaUnits, costBasisUsd: usd }];
-        };
-        let next = bump(prev, asset.id, gotUnits, valueUsd);
-        next = bump(next, offerCoin.assetId, -paidUnits, 0);
-        return next;
-      });
-      setTxHistory((prev) => [
-        {
-          id: uid(),
-          assetName: `${asset.ticker} ⇄ ${offerCoin.ticker}`,
-          amountUsd: valueUsd,
-          currency: "usd",
-          time: new Date(),
-          type: "swap",
-          txId: res.targetTxId || t.txId,
-          kind: "swap",
-          feeBps: res.fee?.feeBps ?? null,
-          feeAmount: res.fee?.feeUnits ?? null,
-          feeTicker,
-          netAmount: res.fee?.buyerReceivesUnits ?? null,
-        },
-        ...prev,
-      ]);
-      showToast(
-        `Swapped ${paidUnits} ${offerCoin.ticker} → ${gotUnits} ${asset.ticker}`
-      );
+      showToast(`Offer sent to ${asset.name} — they'll see it in their dashboard`);
     } catch (e) {
-      showToast(e.message || "Swap failed — please try again");
+      showToast(e.message || "Couldn't send the offer — please try again");
     }
   };
 
@@ -2353,6 +2402,9 @@ function AppInner() {
               netWorthUsd={netWorthUsd}
               isAdmin={isAdmin}
               onOpenAdmin={() => setShowAdmin(true)}
+              offerInbox={offerInbox}
+              offerOutbox={offerOutbox}
+              onOfferAction={handleOfferAction}
             />
           )
         )}
@@ -5660,8 +5712,14 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
   const [sovPay, setSovPay] = useState("usd");
   const [offerCoinId, setOfferCoinId] = useState("");
   const [offerUnits, setOfferUnits] = useState("");
+  // "You receive" is also editable: typing it re-quotes in the inverse
+  // direction (how many to offer for the requested net target units).
+  const [requestUnits, setRequestUnits] = useState("");
+  // Tracks which field the user edited last so quotes don't fight each other.
+  const [lastEdited, setLastEdited] = useState("offer"); // "offer" | "request"
   const [offerBalances, setOfferBalances] = useState({});
   const [balancesLoading, setBalancesLoading] = useState(false);
+  const [offerSent, setOfferSent] = useState(false);
 
   // Server-authoritative 80-bps fee quotes. The client never computes fees —
   // it only displays what the backend quotes; settlement recomputes them.
@@ -5681,6 +5739,7 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
   const effectivePayId = isSovereign ? "trade-usd" : usePhase ? "phase" : payCurrency;
   const numericAmount = parseFloat(amount) || 0;
   const numericOfferUnits = Math.floor(parseFloat(offerUnits) || 0);
+  const numericRequestUnits = Math.floor(parseFloat(requestUnits) || 0);
   const availableInPayCurrency = isSovereign ? tradeCashUsd || 0 : cashBalances[payCurrency] || 0;
 
   // Coins this install issued that can be offered (never the target itself).
@@ -5689,6 +5748,7 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
   const offerBalance = offerCoin ? offerBalances[offerCoin.chainId] || 0 : 0;
 
   // Load on-chain balances of the user's own coins when the coin tab opens.
+  // Sovereign ledger balances are whole coin units (never micro-units).
   useEffect(() => {
     if (!isSovereign || sovPay !== "coin" || !sovereignAddress || offerableCoins.length === 0) return;
     if (Object.keys(offerBalances).length > 0) return;
@@ -5697,7 +5757,7 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
       offerableCoins.map((c) =>
         marketApi
           .chainBalance(c.chainId, sovereignAddress)
-          .then((r) => [c.chainId, Math.floor(Number(r.balance || 0) / 1e6)])
+          .then((r) => [c.chainId, Math.floor(Number(r.balance || 0))])
           .catch(() => [c.chainId, 0])
       )
     ).then((pairs) => {
@@ -5747,10 +5807,14 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
   }, [isSovereign, sovPay, numericAmount, asset.chainId]);
 
   // Swap fee quote: debounced; stale responses are discarded via the counter.
+  // Quotes in whichever direction the user edited last: forward from
+  // offered units, or inverse from requested receive units.
   // Depends on offerCoinId (stable string), not the offerCoin object identity.
   useEffect(() => {
     const oc = offerableCoins.find((c) => c.chainId === offerCoinId) || null;
-    if (!isSovereign || sovPay !== "coin" || !oc || !(numericOfferUnits > 0)) {
+    const editingRequest = lastEdited === "request" && numericRequestUnits > 0;
+    const editingOffer = lastEdited === "offer" && numericOfferUnits > 0;
+    if (!isSovereign || sovPay !== "coin" || !oc || (!editingRequest && !editingOffer)) {
       setSwapQuote(null);
       setSwapQuoteError(null);
       setSwapQuoteLoading(false);
@@ -5761,9 +5825,17 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
     const reqId = ++swapQuoteReqRef.current;
     const t = setTimeout(async () => {
       try {
-        const res = await marketApi.swapQuote(asset.chainId, oc.chainId, numericOfferUnits);
+        const res = editingRequest
+          ? await marketApi.swapQuote(asset.chainId, oc.chainId, { requestUnits: numericRequestUnits })
+          : await marketApi.swapQuote(asset.chainId, oc.chainId, { offerUnits: numericOfferUnits });
         if (swapQuoteReqRef.current !== reqId) return;
-        setSwapQuote(res.quote || null);
+        const q = res.quote || null;
+        setSwapQuote(q);
+        // Keep the other field in sync with the authoritative quote.
+        if (q) {
+          if (editingRequest) setOfferUnits(String(Math.ceil(Number(q.offerUnits) || 0)));
+          else setRequestUnits(String(Math.floor(Number(q.buyerReceivesUnits) || 0)));
+        }
       } catch (e) {
         if (swapQuoteReqRef.current !== reqId) return;
         setSwapQuote(null);
@@ -5774,7 +5846,7 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
     }, 400);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isSovereign, sovPay, offerCoinId, numericOfferUnits, asset.chainId]);
+  }, [isSovereign, sovPay, offerCoinId, numericOfferUnits, numericRequestUnits, lastEdited, asset.chainId]);
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -5905,7 +5977,7 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                 </select>
                 {balancesLoading && <p className="field-hint">Loading your coin balances…</p>}
 
-                <label className="field-label">Offer units</label>
+                <label className="field-label">You offer (your coin)</label>
                 <div className="offer-units-row">
                   <input
                     className="text-input"
@@ -5914,16 +5986,26 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                     step="1"
                     placeholder="Whole coins"
                     value={offerUnits}
-                    onChange={(e) => setOfferUnits(e.target.value)}
+                    onChange={(e) => { setOfferUnits(e.target.value); setLastEdited("offer"); }}
                   />
                   <button
                     className="pill-btn"
                     disabled={!offerCoin || offerBalance <= 0}
-                    onClick={() => setOfferUnits(String(offerBalance))}
+                    onClick={() => { setOfferUnits(String(offerBalance)); setLastEdited("offer"); }}
                   >
                     Max
                   </button>
                 </div>
+                <label className="field-label">You receive ({asset.ticker})</label>
+                <input
+                  className="text-input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="Whole coins"
+                  value={requestUnits}
+                  onChange={(e) => { setRequestUnits(e.target.value); setLastEdited("request"); }}
+                />
                 {offerCoin && numericOfferUnits > 0 && !swapQuote && !swapQuoteLoading && !swapQuoteError && (
                   <p className="field-hint">
                     Offer {numericOfferUnits.toLocaleString()} {offerCoin.ticker} (≈ $
@@ -5957,11 +6039,15 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                   </div>
                 )}
 
+                <p className="field-hint">
+                  The issuer will see your offer in their dashboard and can
+                  accept, counter, or decline it. Nothing moves until they accept.
+                </p>
+
                 <button
                   className={`btn-primary btn-large btn-full ${
                     numericOfferUnits < 1 ||
                     numericOfferUnits > offerBalance ||
-                    swapReceiveUnits < 1 ||
                     swapQuoteLoading ||
                     !!swapQuoteError
                       ? "btn-disabled"
@@ -5970,13 +6056,12 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                   disabled={
                     numericOfferUnits < 1 ||
                     numericOfferUnits > offerBalance ||
-                    swapReceiveUnits < 1 ||
                     swapQuoteLoading ||
                     !!swapQuoteError
                   }
-                  onClick={() => onInvestSwap(offerCoin, numericOfferUnits)}
+                  onClick={() => onInvestSwap(offerCoin, numericOfferUnits, numericRequestUnits)}
                 >
-                  Offer {offerCoin ? offerCoin.ticker : "coins"}
+                  Send Offer
                 </button>
               </>
             )}
@@ -6724,8 +6809,13 @@ function DashboardTab({
   netWorthUsd,
   isAdmin,
   onOpenAdmin,
+  offerInbox,
+  offerOutbox,
+  onOfferAction,
 }) {
   const [showFundModal, setShowFundModal] = useState(false);
+  // Counter-offer editing state: { offerId, offerUnits, requestUnits }.
+  const [countering, setCountering] = useState(null);
 
   const enrichedHoldings = holdings
     .map((h) => {
@@ -6753,10 +6843,22 @@ function DashboardTab({
   // The user's own published listings ("My Onchained Products").
   const ownedProducts = assets.filter((a) => a.isOwner);
   const ownedProductsMarketUsd = ownedProducts.reduce((sum, a) => sum + a.price * (a.totalMinted || 100), 0);
+  // Soft valuation: real on-chain balance at the listing price.
   const ownedProductsRetainedUsd = ownedProducts.reduce(
-    (sum, a) => sum + a.price * (a.retainedShares != null ? a.retainedShares : a.equityRetained),
+    (sum, a) => {
+      const stake = a.availableUnits != null
+        ? a.availableUnits
+        : (a.retainedShares != null ? a.retainedShares : a.equityRetained);
+      return sum + a.price * stake;
+    },
     0
   );
+  // Market-backed signal: how much of each coin's public float buyers
+  // actually purchased. The more people buy, the more of the soft net
+  // worth is real.
+  const ownedRealizationPct = ownedProducts.length > 0
+    ? ownedProducts.reduce((sum, a) => sum + (a.realizationRatio != null ? a.realizationRatio : 0), 0) / ownedProducts.length
+    : 0;
 
   // Pure currency: PHASE coins + every funded cash balance, expressed in USD.
   const cashEntries = Object.entries(cashBalances).filter(([, amt]) => amt > 0);
@@ -6792,9 +6894,16 @@ function DashboardTab({
             <CurrencyDropdown currency={currency} setCurrency={setCurrency} />
           </div>
         </div>
-        <span className="stat-label">Total Net Worth</span>
+        <span className="stat-label">Soft Net Worth</span>
         <span className="net-worth-value">{formatCurrency(netWorthUsd, currency, liveFx)}</span>
-        <p className="net-worth-disclaimer">On-chained value doesn't necessarily reflect the market.</p>
+        <p className="net-worth-disclaimer">
+          Soft net worth values your issued coins at their listing price — it
+          only becomes real as buyers purchase your coins. On-chained value
+          doesn't necessarily reflect the market.
+          {ownedProducts.length > 0 && (
+            <> Buyers have so far purchased {(ownedRealizationPct * 100).toFixed(1)}% of your public float.</>
+          )}
+        </p>
 
         <div className="net-worth-charts-row">
           <AllocationDonut
@@ -6919,6 +7028,13 @@ function DashboardTab({
                     {a.subsection ? ` · ${a.subsection}` : ""}
                   </span>
                   {a.chainId && <span className="chain-id-stamp">{a.chainId}</span>}
+                  {a.realizationRatio != null && (
+                    <span className="holdings-category-tag">
+                      {(a.realizationRatio * 100).toFixed(1)}% of public float sold
+                      {a.publicFloatSoldUnits != null &&
+                        ` (${a.publicFloatSoldUnits.toLocaleString()} ${a.ticker})`}
+                    </span>
+                  )}
                 </div>
                 <div className="product-row-stat">
                   <span className="stat-label">Market Value</span>
@@ -6927,9 +7043,15 @@ function DashboardTab({
                   </span>
                 </div>
                 <div className="product-row-stat">
-                  <span className="stat-label">Your Stake ({a.equityRetained}%)</span>
+                  <span className="stat-label">Your Stake (soft)</span>
                   <span className="stat-value">
-                    {formatCurrency(a.price * (a.retainedShares != null ? a.retainedShares : a.equityRetained), currency, liveFx)}
+                    {formatCurrency(
+                      a.price * (a.availableUnits != null
+                        ? a.availableUnits
+                        : (a.retainedShares != null ? a.retainedShares : a.equityRetained)),
+                      currency,
+                      liveFx
+                    )}
                   </span>
                 </div>
               </div>
@@ -6937,6 +7059,136 @@ function DashboardTab({
           </div>
         )}
       </section>
+
+      {/* ---------------- Swap Offers ---------------- */}
+      {(offerInbox?.length > 0 || offerOutbox?.length > 0) && (
+        <section className="glass-card offers-card">
+          <div className="dash-section-header">
+            <h3 className="subsection-title">Swap Offers</h3>
+          </div>
+
+          {offerInbox?.length > 0 && (
+            <>
+              <p className="field-label">Incoming — others want your coins</p>
+              <div className="products-list">
+                {offerInbox.map((o) => (
+                  <div className="product-row" key={o.id}>
+                    <div className="product-row-main">
+                      <span className="holdings-name">
+                        {o.offerTicker} → {o.targetTicker}
+                      </span>
+                      <span className="holdings-category-tag">
+                        They offer {Number(o.offerUnits).toLocaleString()} {o.offerTicker}
+                        {" "}for {Number(o.requestUnits).toLocaleString()} {o.targetTicker}
+                        {o.status === "countered" && " (you countered — waiting on them)"}
+                      </span>
+                      <span className="holdings-category-tag">
+                        Status: {o.status}
+                      </span>
+                    </div>
+                    {o.status === "pending" && (
+                      <div className="product-row-stat">
+                        {countering?.offerId === o.id ? (
+                          <>
+                            <input
+                              className="text-input"
+                              type="number"
+                              min="1"
+                              step="1"
+                              placeholder="Your units"
+                              value={countering.offerUnits}
+                              onChange={(e) => setCountering({ ...countering, offerUnits: e.target.value })}
+                            />
+                            <input
+                              className="text-input"
+                              type="number"
+                              min="1"
+                              step="1"
+                              placeholder="Their units"
+                              value={countering.requestUnits}
+                              onChange={(e) => setCountering({ ...countering, requestUnits: e.target.value })}
+                            />
+                            <div className="offer-units-row">
+                              <button
+                                className="btn-primary btn-small"
+                                onClick={() => {
+                                  onOfferAction("counter", o.id, {
+                                    offerUnits: Math.floor(Number(countering.offerUnits) || 0),
+                                    requestUnits: Math.floor(Number(countering.requestUnits) || 0),
+                                  });
+                                  setCountering(null);
+                                }}
+                              >
+                                Send counter
+                              </button>
+                              <button className="btn-secondary btn-small" onClick={() => setCountering(null)}>
+                                Cancel
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="offer-units-row">
+                            <button className="btn-primary btn-small" onClick={() => onOfferAction("accept", o.id)}>
+                              Accept
+                            </button>
+                            <button
+                              className="btn-secondary btn-small"
+                              onClick={() => setCountering({ offerId: o.id, offerUnits: o.offerUnits, requestUnits: o.requestUnits })}
+                            >
+                              Counter
+                            </button>
+                            <button className="btn-secondary btn-small" onClick={() => onOfferAction("decline", o.id)}>
+                              Decline
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {offerOutbox?.length > 0 && (
+            <>
+              <p className="field-label">Outgoing — your offers to others</p>
+              <div className="products-list">
+                {offerOutbox.map((o) => (
+                  <div className="product-row" key={o.id}>
+                    <div className="product-row-main">
+                      <span className="holdings-name">
+                        {o.offerTicker} → {o.targetTicker}
+                      </span>
+                      <span className="holdings-category-tag">
+                        You offer {Number(o.offerUnits).toLocaleString()} {o.offerTicker}
+                        {" "}for {Number(o.requestUnits).toLocaleString()} {o.targetTicker}
+                      </span>
+                      <span className="holdings-category-tag">
+                        Status: {o.status}
+                        {o.status === "countered" &&
+                          ` — they countered: ${Number(o.counterOfferUnits).toLocaleString()} ${o.offerTicker} for ${Number(o.counterRequestUnits).toLocaleString()} ${o.targetTicker}`}
+                      </span>
+                    </div>
+                    {o.status === "countered" && (
+                      <div className="product-row-stat">
+                        <div className="offer-units-row">
+                          <button className="btn-primary btn-small" onClick={() => onOfferAction("accept", o.id)}>
+                            Accept counter
+                          </button>
+                          <button className="btn-secondary btn-small" onClick={() => onOfferAction("decline", o.id)}>
+                            Decline
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+      )}
 
       {/* ---------------- Currency & Cash ---------------- */}
       <section className="glass-card cash-card">
