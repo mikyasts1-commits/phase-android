@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { MARKETPLACE_LOCKED, CRYPTO_FUNDING_LOCKED, GO_LIVE_LOCKED } from "./feature-flags.js";
 import { generateWallet, restoreWallet, createSovereignChain } from "./sovereign-client.js";
-// stripe-client.js is retained for the future live-Stripe integration;
-// card funding UI is currently disabled (see CardFundPanel).
+// stripe-client.js powers live Stripe card funding (see CardFundPanel).
+import { mountCardElement, confirmCardPayment } from "./stripe-client.js";
 import { reportError } from "./sentry.js";
 
 /* ------------------------- Phase backend API client ------------------------- */
@@ -290,7 +290,7 @@ const fundingApi = {
     backendFetch(`/funding/btc/address?userId=${encodeURIComponent(userId)}`),
   getBtcBalance: (userId) =>
     backendFetch(`/funding/btc/balance?userId=${encodeURIComponent(userId)}`),
-  // Stripe card funding (currently disabled pending live keys)
+  // Stripe card funding (live)
   createStripeIntent: (userId, amountMinor, currency) =>
     backendFetch(`/stripe/payment-intents?userId=${encodeURIComponent(userId)}`, {
       method: "POST",
@@ -742,7 +742,7 @@ function getPhiReply(rawText) {
   }
   if (has("wallet", "fund", "usdc", "circle", "deposit", "crypto")) {
     return {
-      text: "You can fund your account from the Dashboard. Card funding is not available yet; crypto funding is being connected.",
+      text: "You can fund your account from the Dashboard — card funding is live, or you can deposit crypto.",
       actions: [{ label: "Open Dashboard", tab: "dashboard" }],
       suggestions: ["Is this real money?"],
     };
@@ -2090,9 +2090,7 @@ function AppInner() {
         ]);
         await refreshTradeBalances();
         showToast(
-          `Bought ${netUnits} ${asset.ticker} — $${paidUsd.toFixed(2)}${
-            feeUnits > 0 ? ` (incl. ${feeUnits} ${feeTicker} Phase fee)` : ""
-          }`
+          `Bought ${netUnits} ${asset.ticker} — $${paidUsd.toFixed(2)}`
         );
       } catch (e) {
         if (e.code === "insufficient_funds" || e.status === 402) {
@@ -2221,9 +2219,7 @@ function AppInner() {
         ...prev,
       ]);
       showToast(
-        `Swapped ${paidUnits} ${offerCoin.ticker} → ${gotUnits} ${asset.ticker}${
-          feeUnits > 0 ? ` (${feeUnits} ${feeTicker} Phase fee)` : ""
-        }`
+        `Swapped ${paidUnits} ${offerCoin.ticker} → ${gotUnits} ${asset.ticker}`
       );
     } catch (e) {
       showToast(e.message || "Swap failed — please try again");
@@ -3544,6 +3540,9 @@ function IssuanceFlow({ coin, issuerAddress, onBack, onComplete }) {
             (full terms) and agree to be bound by its covenants to each purchaser of {coin.ticker}.
           </span>
         </label>
+        <p className="field-hint">
+          Phase charges 0.80% on applicable transactions.
+        </p>
         <button
           className={`btn-primary btn-large ${!canSign ? "btn-disabled" : ""}`}
           onClick={signAndMint}
@@ -4058,14 +4057,167 @@ function BringYourOwnNetworkFlow({ onBack, onPublish }) {
 }
 
 /* ------------------------- Card funding (Stripe) ------------------------- */
-// Card funding is disabled until live Stripe keys are configured.
-// The test-mode Card Element flow was removed; this panel renders a
-// placeholder message instead of payment UI.
+// Live Stripe card funding. Creates a PaymentIntent on the backend, collects
+// the card with Stripe Elements (3D Secure is handled automatically), then
+// confirms server-side so the fiat ledger credits the account. The secret
+// key never leaves the backend; the app only ever sees the publishable key
+// and per-payment client secrets.
 
 function CardFundPanel({ onFunded }) {
+  const [amount, setAmount] = useState("");
+  // checking -> mounting -> ready -> processing -> success
+  // (unavailable when the backend reports Stripe is not live)
+  const [status, setStatus] = useState("checking");
+  const [error, setError] = useState(null);
+  const [mountNode, setMountNode] = useState(null);
+  const cardRef = useRef(null);
+
+  // 1. Ask the backend whether live card funding is configured.
+  useEffect(() => {
+    let dead = false;
+    (async () => {
+      try {
+        const s = await backendFetch("/stripe/status", { retries: 1 });
+        if (!dead) setStatus(s.configured && s.livemode ? "mounting" : "unavailable");
+      } catch (e) {
+        if (!dead) {
+          setError("Couldn't reach Phase's servers — please try again in a moment.");
+          setStatus("unavailable");
+        }
+      }
+    })();
+    return () => {
+      dead = true;
+    };
+  }, []);
+
+  // 2. Mount the Stripe Card Element once its container exists.
+  useEffect(() => {
+    if (status !== "mounting" || !mountNode || cardRef.current) return;
+    let dead = false;
+    let handle = null;
+    mountCardElement(mountNode)
+      .then((h) => {
+        if (dead) {
+          h.destroy();
+          return;
+        }
+        handle = h;
+        cardRef.current = h;
+        setStatus("ready");
+      })
+      .catch((e) => {
+        setError(e.message || "Card entry failed to load.");
+        setStatus("unavailable");
+      });
+    return () => {
+      dead = true;
+      try {
+        handle && handle.destroy();
+      } catch {}
+      if (cardRef.current === handle) cardRef.current = null;
+    };
+  }, [status, mountNode]);
+
+  const cents = Math.round(Number(amount) * 100);
+
+  const fund = async () => {
+    if (!Number.isFinite(cents) || cents < 50) {
+      setError("Enter at least $0.50.");
+      return;
+    }
+    if (!cardRef.current) {
+      setError("Card entry isn't ready yet — please wait a moment and try again.");
+      return;
+    }
+    setStatus("processing");
+    setError(null);
+    try {
+      const intent = await fundingApi.createStripeIntent(currentUserId(), cents, "cad");
+      if (!intent.client_secret || !intent.id) {
+        throw new Error("Payment could not be started. Please try again.");
+      }
+      // Handles 3D Secure automatically; throws on decline/cancel.
+      await confirmCardPayment(cardRef.current.card, intent.client_secret);
+      await fundingApi.confirmStripeIntent(intent.id);
+      setStatus("success");
+      onFunded && onFunded("cad", cents / 100, "card");
+    } catch (e) {
+      setError(e.message || "Card payment failed. Please try again.");
+      setStatus("ready");
+    }
+  };
+
+  if (status === "checking" || status === "mounting") {
+    return (
+      <div className="card-fund-panel">
+        <div className="funding-processing">
+          <span className="spinner spinner-large" />
+          <p className="section-sub">Loading secure card payments…</p>
+        </div>
+        {/* Mount target exists before it is shown so Stripe can attach. */}
+        <div ref={setMountNode} className="stripe-card-element" style={{ display: "none" }} />
+      </div>
+    );
+  }
+
+  if (status === "unavailable") {
+    return (
+      <div className="card-fund-panel">
+        <p className="section-sub">
+          {error || "Card funding is not available yet."}
+        </p>
+      </div>
+    );
+  }
+
+  if (status === "success") {
+    return (
+      <div className="card-fund-panel">
+        <div className="funding-processing">
+          <h3>Payment successful</h3>
+          <p className="section-sub">
+            Your card was charged and the funds are on their way to your Phase account.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="card-fund-panel">
-      <p className="section-sub">Card funding is not available yet.</p>
+      <label className="field-label" htmlFor="card-fund-amount">
+        Amount (CAD)
+      </label>
+      <div className="amount-row">
+        <span className="amount-currency">$</span>
+        <input
+          id="card-fund-amount"
+          className="amount-input"
+          inputMode="decimal"
+          placeholder="25.00"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, ""))}
+          disabled={status === "processing"}
+        />
+      </div>
+      <label className="field-label">Card details</label>
+      <div ref={setMountNode} className="stripe-card-element" />
+      {error && <p className="field-hint field-error">{error}</p>}
+      <button
+        className={`btn-primary btn-large btn-full ${status === "processing" ? "btn-disabled" : ""}`}
+        onClick={fund}
+        disabled={status === "processing"}
+      >
+        {status === "processing"
+          ? "Processing…"
+          : cents >= 50
+            ? `Fund $${(cents / 100).toFixed(2)}`
+            : "Fund account"}
+      </button>
+      <p className="field-hint">
+        Secured by Stripe. Your card details never touch Phase&apos;s servers.
+      </p>
     </div>
   );
 }
@@ -4546,7 +4698,39 @@ function CoinDetailModal({ coin, inCompare, onToggleCompare, onClose, onBuy }) {
             </p>
           </div>
         </div>
+        {(coin.tagline || coin.valueThesis) && (
+          <div className="coin-detail-about">
+            {coin.tagline && <p className="coin-detail-tagline">{coin.tagline}</p>}
+            {coin.valueThesis && <p className="coin-detail-thesis">{coin.valueThesis}</p>}
+          </div>
+        )}
+        {((coin.socialProfiles && coin.socialProfiles.length > 0) || coin.websiteUrl) && (
+          <div className="asset-external-links coin-detail-links">
+            {(coin.socialProfiles || []).map((p, i) => (
+              <a
+                key={`social-${p.platform}-${i}`}
+                className="btn-external-link btn-social-link"
+                href={p.url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <Icon name="external" size={14} /> Visit {p.platform} Profile
+              </a>
+            ))}
+            {coin.websiteUrl && (
+              <a
+                className="btn-external-link btn-website-link"
+                href={coin.websiteUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <Icon name="external" size={14} /> Visit Website
+              </a>
+            )}
+          </div>
+        )}
         <div className="coin-detail-rows">
+          <p className="coin-detail-section-label">Financials</p>
           {rows.map(([label, value]) => (
             <div className="coin-detail-row" key={label}>
               <span className="stat-label">{label}</span>
@@ -4674,7 +4858,7 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
         id: `coin-${c.chainId}`,
         assetId: `coin-${c.chainId}`,
         price: Number(c.priceUsd) || 0,
-        tagline: `${c.name} — sovereign coin`,
+        tagline: c.tagline || `${c.name} — sovereign coin`,
         mine: c.issuerUserId === currentUserId(),
       }));
       setDirCoins(coins);
@@ -4782,9 +4966,6 @@ function MarketplaceTab({ assets, currency, setCurrency, onInvest, onInvestSwap,
         <h2 className="section-title">Marketplace</h2>
         <CurrencyDropdown currency={currency} setCurrency={setCurrency} />
       </div>
-      <p className="field-hint market-fee-disclosure">
-        Phase charges 0.80% on applicable transactions.
-      </p>
 
       {/* Issuer search — every person who minted a coin on Phase, searchable.
           No list until you search: the directory is a search function. */}
@@ -5688,31 +5869,12 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                       <span>You pay</span>
                       <strong>${Number(quote.grossUsd).toFixed(2)}</strong>
                     </div>
-                    <div className="fee-row">
-                      <span>Gross</span>
-                      <strong>
-                        {Number(quote.grossUnits).toLocaleString()} {quote.ticker}
-                      </strong>
-                    </div>
-                    <div className="fee-row">
-                      <span>Phase fee ({(quote.feeBps / 100).toFixed(2)}%)</span>
-                      <strong>
-                        {Number(quote.feeUnits).toLocaleString()} {quote.feeAssetSymbol ?? quote.ticker}
-                      </strong>
-                    </div>
-                    <p className="fee-note">
-                      The fee is taken from the coins you receive — the seller
-                      gets the full ${Number(quote.grossUsd).toFixed(2)}.
-                    </p>
                     <div className="fee-row fee-row-total">
                       <span>You receive</span>
                       <strong>
                         {Number(quote.buyerReceivesUnits).toLocaleString()} {quote.ticker}
                       </strong>
                     </div>
-                    <p className="fee-disclosure">
-                      Phase charges 0.80% on applicable transactions.
-                    </p>
                   </div>
                 )}
 
@@ -5796,18 +5958,6 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                         {Number(swapQuote.offerUnits).toLocaleString()} {swapQuote.offerTicker}
                       </strong>
                     </div>
-                    <div className="fee-row">
-                      <span>Gross receive</span>
-                      <strong>
-                        {Number(swapQuote.grossUnits).toLocaleString()} {swapQuote.targetTicker}
-                      </strong>
-                    </div>
-                    <div className="fee-row">
-                      <span>Phase fee ({(swapQuote.feeBps / 100).toFixed(2)}%)</span>
-                      <strong>
-                        {Number(swapQuote.feeUnits).toLocaleString()} {swapQuote.targetTicker}
-                      </strong>
-                    </div>
                     <div className="fee-row fee-row-total">
                       <span>You receive</span>
                       <strong>
@@ -5815,9 +5965,6 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                         {swapQuote.targetTicker}
                       </strong>
                     </div>
-                    <p className="fee-disclosure">
-                      Phase charges 0.80% on applicable transactions.
-                    </p>
                   </div>
                 )}
 
@@ -6924,13 +7071,6 @@ function DashboardTab({
                   <span className="stat-label">
                     {formatCurrency(tx.amountUsd, tx.currency, liveFx)}
                   </span>
-                  {tx.feeBps != null && tx.feeAmount != null && (
-                    <span className="tx-fee-line">
-                      {tx.kind === "swap"
-                        ? `Fee ${(tx.feeBps / 100).toFixed(2)}% · ${Number(tx.feeAmount).toLocaleString()} ${tx.feeTicker || ""} · you received ${Number(tx.netAmount || 0).toLocaleString()} ${tx.feeTicker || ""}`
-                        : `Fee ${(tx.feeBps / 100).toFixed(2)}% · ${Number(tx.feeAmount).toLocaleString()} ${tx.feeAssetSymbol || ""} · you received ${Number(tx.netAmount || 0).toLocaleString()} ${tx.feeAssetSymbol || ""}`}
-                    </span>
-                  )}
                 </span>
               </div>
             ))}
@@ -7432,6 +7572,11 @@ function GlobalStyles() {
       /* ---------------- Coin detail + compare ---------------- */
       .coin-detail-head { margin-bottom: 14px; }
       .coin-detail-head h3 { margin: 0; font-size: 17px; }
+      .coin-detail-about { margin-bottom: 12px; }
+      .coin-detail-tagline { font-size: 14px; font-weight: 700; margin: 0 0 6px; }
+      .coin-detail-thesis { font-size: 13px; line-height: 1.55; opacity: 0.8; margin: 0; white-space: pre-wrap; }
+      .coin-detail-links { margin-bottom: 14px; }
+      .coin-detail-section-label { font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.55; margin: 0 0 4px; }
       .coin-detail-rows { display: flex; flex-direction: column; margin-bottom: 14px; }
       .coin-detail-row {
         display: flex; justify-content: space-between; align-items: center;
