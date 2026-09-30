@@ -72,10 +72,18 @@ export async function signTransaction(wallet, tx) {
 }
 
 // --- API calls ---
+// All sovereign-ledger routes require a valid Bearer token server-side
+// (resolveBearerUserId -> 401). Attach it here so direct chain operations
+// (create, submit, balance, get) are authenticated like every other call.
 async function api(method, path, body) {
+  const headers = { "content-type": "application/json" };
+  try {
+    const token = localStorage.getItem("phase_auth_token");
+    if (token) headers["authorization"] = `Bearer ${token}`;
+  } catch {}
   const res = await fetch(SOVEREIGN_API + path, {
     method,
-    headers: { "content-type": "application/json" },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   const json = await res.json().catch(() => ({}));

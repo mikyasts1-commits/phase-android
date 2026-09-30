@@ -323,10 +323,11 @@ const fundingApi = {
   getBtcBalance: (userId) =>
     backendFetch(`/funding/btc/balance?userId=${encodeURIComponent(userId)}`),
   // Stripe card funding (live)
-  createStripeIntent: (userId, amountMinor, currency) =>
+  createStripeIntent: (userId, amountMinor, currency, idempotencyKey) =>
     backendFetch(`/stripe/payment-intents?userId=${encodeURIComponent(userId)}`, {
       method: "POST",
       body: { amount: amountMinor, currency, description: "Phase account funding" },
+      idempotencyKey: idempotencyKey || `stripe-fund-${userId}-${Date.now()}`,
     }),
   confirmStripeIntent: (paymentIntentId) =>
     backendFetch(`/stripe/payment-intents/${encodeURIComponent(paymentIntentId)}/confirm`, {
@@ -708,7 +709,7 @@ const NEWS_ITEMS = [
 // the UI changes.
 
 const PHI_GREETING =
-  "Hi, I'm Phi \u2014 your guide to Phase. Ask me anything: going live, the coin split, the Issuer Agreement, or investing.";
+  "hi im james \u2014 your guide to Phase. Ask me anything: going live, the coin split, the Issuer Agreement, or investing.";
 
 const PHI_SUGGESTIONS = [
   "How do I go live?",
@@ -1477,7 +1478,8 @@ function AuthScreen({ onAuthSuccess, initialMode = "signup", notice, onOpenPriva
     try {
       if (mode === "forgot") {
         const res = await authApi.forgotPassword(cleanEmail);
-        // Dev mode: backend returns the token directly
+        // The backend never returns the token (it is delivered out-of-band);
+        // the field is kept only for forwards compatibility.
         if (res.resetToken) setResetToken(res.resetToken);
         setResetSent(true);
         setMode("reset");
@@ -2756,7 +2758,7 @@ function GoLiveTab({ onPublish, issuerAddress }) {
             websiteUrl: normalizeUrl(websiteUrl) || null,
             verification: { status: "unverified", lookupFollowers: null, lookupEngagement: null },
             compliance: {
-              docFileName: isMeme ? null : "Issuer Agreement (digitally signed)",
+              docFileName: isMeme ? null : "Issuer Agreement (signed)",
               generatedAgreement: null,
               signature: null,
               issuanceCoinId: mintedCoin.id,
@@ -4177,7 +4179,11 @@ function CardFundPanel({ onFunded }) {
     setStatus("processing");
     setError(null);
     try {
-      const intent = await fundingApi.createStripeIntent(currentUserId(), cents, "cad");
+      // One idempotency key per funding attempt: backendFetch's automatic
+      // retries reuse it, so a retried request can never create a second
+      // PaymentIntent (and a second charge) at Stripe.
+      const fundingKey = `stripe-fund-${currentUserId()}-${cents}-cad-${Date.now()}`;
+      const intent = await fundingApi.createStripeIntent(currentUserId(), cents, "cad", fundingKey);
       if (!intent.client_secret || !intent.id) {
         throw new Error("Payment could not be started. Please try again.");
       }
@@ -4265,6 +4271,10 @@ function CardFundPanel({ onFunded }) {
 
 
 function FundAccountModal({ onClose, onFund }) {
+  // Crypto funding rails are testnet-only (Base Sepolia, Polygon Amoy,
+  // Solana Devnet, Bitcoin Testnet). Keep the Crypto tab hidden until
+  // mainnet funding rails are live.
+  const CRYPTO_FUNDING_ENABLED = false;
   const [method, setMethod] = useState("card"); // card | crypto
   const [step, setStep] = useState("deposit"); // deposit | waiting | confirmed (crypto flow)
   const [cryptoLoading, setCryptoLoading] = useState(false); // crypto tab loads lazily
@@ -4298,7 +4308,7 @@ function FundAccountModal({ onClose, onFund }) {
   // The Card tab never depends on it, so a crypto backend hiccup can't
   // block card payments.
   useEffect(() => {
-    if (method === "crypto" && !depositInfo && !cryptoLoading) {
+    if (CRYPTO_FUNDING_ENABLED && method === "crypto" && !depositInfo && !cryptoLoading) {
       loadDepositInfo();
     }
   }, [method]);
@@ -4428,12 +4438,14 @@ function FundAccountModal({ onClose, onFund }) {
               >
                 Card
               </button>
+              {CRYPTO_FUNDING_ENABLED && (
               <button
                 className={"chain-btn" + (method === "crypto" ? " chain-btn-active" : "")}
                 onClick={() => setMethod("crypto")}
               >
                 Crypto
               </button>
+              )}
             </div>
 
             {method === "card" ? (
@@ -5745,7 +5757,18 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
   // Coins this install issued that can be offered (never the target itself).
   const offerableCoins = (myCoins || []).filter((c) => c.chainId !== asset.chainId);
   const offerCoin = offerableCoins.find((c) => c.chainId === offerCoinId) || null;
-  const offerBalance = offerCoin ? offerBalances[offerCoin.chainId] || 0 : 0;
+  // Spendable balance of one of the user's own coins. availableUnits is the
+  // backend-enriched issuer balance looked up at the coin's RECORDED issuer
+  // address (the address credited at genesis) — it stays correct even if
+  // this device's wallet changed since minting. The live lookup covers coins
+  // received at the current wallet address. Take whichever is larger.
+  const availUnitsFor = (c) => {
+    if (!c) return 0;
+    const enriched = c.availableUnits != null ? Math.floor(Number(c.availableUnits)) : 0;
+    const live = offerBalances[c.chainId] || 0;
+    return Math.max(enriched, live);
+  };
+  const offerBalance = availUnitsFor(offerCoin);
 
   // Load on-chain balances of the user's own coins when the coin tab opens.
   // Sovereign ledger balances are whole coin units (never micro-units).
@@ -5968,10 +5991,7 @@ function InvestModal({ asset, phaseCoins, cashBalances, liveFx, tradeCashUsd, so
                 >
                   {offerableCoins.map((c) => (
                     <option key={c.chainId} value={c.chainId}>
-                      {c.ticker} — {c.name}
-                      {offerBalances[c.chainId] != null
-                        ? ` (${offerBalances[c.chainId].toLocaleString()} avail.)`
-                        : ""}
+                      {c.ticker} — {c.name} ({availUnitsFor(c).toLocaleString()} avail.)
                     </option>
                   ))}
                 </select>
@@ -7376,7 +7396,7 @@ function ChatbotLauncher({ open, setOpen, onNavigate }) {
       <button
         className={`chat-launcher ${open ? "chat-launcher-open" : ""}`}
         onClick={() => setOpen(!open)}
-        aria-label="Open Phi assistant"
+        aria-label="Open james assistant"
       >
         {open ? <Icon name="close" size={20} /> : <PhiMark size={28} animated />}
       </button>
@@ -7385,7 +7405,7 @@ function ChatbotLauncher({ open, setOpen, onNavigate }) {
         <div className="chat-panel glass-card">
           <div className="chat-panel-header">
             <PhiMark size={22} animated={false} />
-            <span>Phi \u2014 your guide</span>
+            <span>james \u2014 your guide</span>
           </div>
           <div className="chat-panel-body" ref={bodyRef}>
             {history.map((msg, i) => (
@@ -7598,7 +7618,7 @@ function GlobalStyles() {
       .platform-android .toast { bottom: calc(76px + env(safe-area-inset-bottom, 20px)); }
       .platform-android.app-root { padding-bottom: calc(64px + env(safe-area-inset-bottom, 20px)); }
       .top-nav-left { display: flex; align-items: center; gap: 8px; }
-      .brand-word { font-weight: 700; font-size: 18px; letter-spacing: -0.02em; color: var(--navy); }
+      .brand-word { font-weight: 700; font-size: 18px; letter-spacing: -0.02em; color: #00e676; text-shadow: 0 0 8px rgba(0,230,118,0.85), 0 0 24px rgba(0,230,118,0.5), 0 0 64px rgba(0,230,118,0.35); }
       .top-nav-tabs { display: flex; gap: 4px; background: rgba(0,230,118,0.07); border-radius: 14px; padding: 4px; }
       .nav-tab {
         border: none; background: transparent; padding: 8px 14px; border-radius: 10px;
