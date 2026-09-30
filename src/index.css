@@ -2,4 +2,4 @@
 * { box-sizing: border-box; }
 html, body, #root { margin: 0; padding: 0; min-height: 100%; }
 html { -webkit-text-size-adjust: 100%; }
-body { overscroll-behavior-y: none; }
+body { overscroll-behavior-y: none; background: #050807; color: #e9f5ec; }
