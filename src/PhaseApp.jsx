@@ -1769,9 +1769,17 @@ function AppInner() {
   }, [authUser]);
   // Welcoming splash: Phase mark on open, fades away quickly.
   useEffect(() => {
-    const t = setTimeout(() => setShowSplash(false), 1400);
+    const t = setTimeout(() => setShowSplash(false), 2600);
     return () => clearTimeout(t);
   }, []);
+  // Soft page-enter animation on tab switch (re-triggers CSS, no remount).
+  useEffect(() => {
+    const el = document.querySelector(".app-main");
+    if (!el) return;
+    el.classList.remove("tab-enter");
+    void el.offsetWidth;
+    el.classList.add("tab-enter");
+  }, [activeTab]);
   // Fetch the user's real issued coins from the backend and merge them into
   // the asset list as owned products.
   const refreshMyCoins = useCallback(async () => {
@@ -2476,11 +2484,80 @@ function BackgroundGrid() {
 /* ------------------------------ Splash ------------------------------------- */
 
 function SplashScreen() {
+  const canvasRef = useRef(null);
+  const reduceMotion =
+    typeof window !== "undefined" &&
+    window.matchMedia &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Matrix-style digital rain behind the logo.
+  useEffect(() => {
+    if (reduceMotion) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const glyphs = "01\u03a6\u039e$#<>/\\|*+=".split("");
+    const fontSize = 14;
+    let w = 0, h = 0, columns = 0, drops = [];
+    const resize = () => {
+      w = canvas.width = canvas.offsetWidth;
+      h = canvas.height = canvas.offsetHeight;
+      columns = Math.max(1, Math.floor(w / fontSize));
+      drops = Array.from({ length: columns }, () => Math.random() * -40);
+    };
+    resize();
+    window.addEventListener("resize", resize);
+    let raf = 0;
+    let last = 0;
+    const draw = (t) => {
+      raf = requestAnimationFrame(draw);
+      if (t - last < 55) return; // ~18fps: cheap but smooth enough
+      last = t;
+      ctx.fillStyle = "rgba(4, 8, 6, 0.22)";
+      ctx.fillRect(0, 0, w, h);
+      ctx.font = fontSize + "px monospace";
+      for (let i = 0; i < columns; i++) {
+        const g = glyphs[(Math.random() * glyphs.length) | 0];
+        const x = i * fontSize;
+        const y = drops[i] * fontSize;
+        ctx.fillStyle = Math.random() < 0.07 ? "#b8ffd9" : "#00e676";
+        ctx.globalAlpha = 0.5;
+        ctx.fillText(g, x, y);
+        ctx.globalAlpha = 1;
+        if (y > h && Math.random() > 0.976) drops[i] = 0;
+        drops[i]++;
+      }
+    };
+    raf = requestAnimationFrame(draw);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", resize);
+    };
+  }, [reduceMotion]);
+
   return (
     <div className="splash-overlay" aria-hidden="true">
+      {!reduceMotion && <canvas ref={canvasRef} className="splash-rain" />}
+      <div className="splash-vignette" />
       <div className="splash-mark">
-        <PhiMark size={84} animated />
-        <div className="splash-word">Phase</div>
+        <img src="logo.png" alt="" className="splash-logo" draggable="false" />
+        <div className="splash-word">
+          {"PHASE".split("").map((ch, i) => (
+            <span
+              key={i}
+              className="splash-letter"
+              style={reduceMotion ? undefined : { animationDelay: `${0.55 + i * 0.09}s` }}
+            >
+              {ch}
+            </span>
+          ))}
+        </div>
+        <div className="splash-tag">ONCHAIN SETTLEMENT</div>
+        {!reduceMotion && (
+          <div className="splash-bar">
+            <div className="splash-bar-fill" />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -6812,6 +6889,40 @@ function AdminUsersTab({ showToast }) {
 
 /* ============================== DASHBOARD TAB ================================ */
 
+/* Smoothly animates a number toward its target whenever the target changes. */
+function useCountUp(target, duration = 900) {
+  const [val, setVal] = useState(target);
+  const fromRef = useRef(target);
+  useEffect(() => {
+    const from = fromRef.current;
+    if (from === target) {
+      setVal(target);
+      return;
+    }
+    if (
+      typeof window !== "undefined" &&
+      window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      fromRef.current = target;
+      setVal(target);
+      return;
+    }
+    let raf = 0;
+    const start = performance.now();
+    const step = (now) => {
+      const p = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - p, 3);
+      setVal(from + (target - from) * eased);
+      if (p < 1) raf = requestAnimationFrame(step);
+      else fromRef.current = target;
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [target, duration]);
+  return val;
+}
+
 function DashboardTab({
   assets,
   holdings,
@@ -6836,6 +6947,8 @@ function DashboardTab({
   const [showFundModal, setShowFundModal] = useState(false);
   // Counter-offer editing state: { offerId, offerUnits, requestUnits }.
   const [countering, setCountering] = useState(null);
+  // Animated net-worth readout.
+  const animatedNetWorth = useCountUp(netWorthUsd);
 
   const enrichedHoldings = holdings
     .map((h) => {
@@ -6915,7 +7028,7 @@ function DashboardTab({
           </div>
         </div>
         <span className="stat-label">Soft Net Worth</span>
-        <span className="net-worth-value">{formatCurrency(netWorthUsd, currency, liveFx)}</span>
+        <span className="net-worth-value">{formatCurrency(animatedNetWorth, currency, liveFx)}</span>
         <p className="net-worth-disclaimer">
           Soft net worth values your issued coins at their listing price — it
           only becomes real as buyers purchase your coins. On-chained value
@@ -7584,14 +7697,98 @@ function GlobalStyles() {
       .splash-overlay {
         position: fixed; inset: 0; z-index: 200;
         display: flex; align-items: center; justify-content: center;
-        background: linear-gradient(160deg, #050807 0%, #070b09 55%, #060a08 100%);
-        animation: splashOut 0.45s ease 0.95s forwards;
-        pointer-events: none;
+        background: #040806;
+        animation: splashOut 0.5s ease 2.1s forwards;
+        pointer-events: none; overflow: hidden;
       }
-      .splash-mark { display: flex; flex-direction: column; align-items: center; gap: 14px; animation: splashIn 0.5s ease both; }
-      .splash-word { font-size: 30px; font-weight: 700; color: var(--navy); letter-spacing: 0.5px; }
-      @keyframes splashIn { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }
+      .splash-rain { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0.55; }
+      .splash-vignette {
+        position: absolute; inset: 0; pointer-events: none;
+        background: radial-gradient(ellipse at center, transparent 26%, rgba(4,8,6,0.82) 76%);
+      }
+      .splash-mark { position: relative; display: flex; flex-direction: column; align-items: center; gap: 18px; }
+      .splash-logo {
+        width: 132px; height: 132px; border-radius: 28px; object-fit: contain;
+        user-select: none; -webkit-user-drag: none;
+        animation: splashLogoBoot 1.1s cubic-bezier(0.2, 0.9, 0.25, 1.15) both,
+                   splashLogoBreathe 2.8s ease-in-out 1.15s infinite;
+      }
+      @keyframes splashLogoBoot {
+        0% { opacity: 0; transform: scale(0.55); filter: blur(16px) brightness(2.6); }
+        55% { opacity: 1; transform: scale(1.07); filter: blur(0) brightness(1.7) drop-shadow(0 0 34px rgba(0,230,118,0.95)); }
+        100% { opacity: 1; transform: scale(1); filter: blur(0) brightness(1) drop-shadow(0 0 20px rgba(0,230,118,0.8)) drop-shadow(0 0 70px rgba(0,230,118,0.35)); }
+      }
+      @keyframes splashLogoBreathe {
+        0%, 100% { transform: scale(1); filter: blur(0) brightness(1) drop-shadow(0 0 20px rgba(0,230,118,0.8)) drop-shadow(0 0 70px rgba(0,230,118,0.35)); }
+        50% { transform: scale(1.045); filter: blur(0) brightness(1.12) drop-shadow(0 0 28px rgba(0,230,118,0.95)) drop-shadow(0 0 90px rgba(0,230,118,0.45)); }
+      }
+      .splash-word { display: flex; gap: 8px; }
+      .splash-letter {
+        font-size: 34px; font-weight: 800; letter-spacing: 2px; color: #00e676;
+        text-shadow: 0 0 10px rgba(0,230,118,0.9), 0 0 36px rgba(0,230,118,0.5), 0 0 90px rgba(0,230,118,0.35);
+        opacity: 0; animation: splashLetter 0.5s cubic-bezier(0.2, 0.7, 0.3, 1.2) forwards;
+      }
+      @keyframes splashLetter {
+        0% { opacity: 0; transform: translateY(16px); filter: blur(8px); }
+        100% { opacity: 1; transform: none; filter: blur(0); }
+      }
+      .splash-tag {
+        font-size: 11px; font-weight: 600; letter-spacing: 7px; text-indent: 7px;
+        color: rgba(0,230,118,0.6);
+        opacity: 0; animation: splashFadeIn 0.9s ease 1.3s forwards;
+      }
+      .splash-bar {
+        width: 184px; height: 2px; border-radius: 2px; overflow: hidden;
+        background: rgba(0,230,118,0.14);
+        opacity: 0; animation: splashFadeIn 0.4s ease 0.85s forwards;
+      }
+      .splash-bar-fill {
+        height: 100%; width: 0; border-radius: 2px;
+        background: #00e676; box-shadow: 0 0 12px rgba(0,230,118,0.9);
+        animation: splashBarFill 1.2s cubic-bezier(0.3, 0.7, 0.3, 1) 0.85s forwards;
+      }
+      @keyframes splashBarFill { to { width: 100%; } }
+      @keyframes splashFadeIn { to { opacity: 1; } }
       @keyframes splashOut { to { opacity: 0; visibility: hidden; } }
+      @media (prefers-reduced-motion: reduce) {
+        .splash-overlay { animation: splashOut 0.3s ease 0.9s forwards; }
+        .splash-logo, .splash-letter, .splash-tag { animation: none; opacity: 1; }
+        .splash-logo { filter: drop-shadow(0 0 20px rgba(0,230,118,0.8)); }
+      }
+
+      /* ---------------- App motion ---------------- */
+      /* Tab switch: soft rise-and-fade on the incoming page (no remount). */
+      .tab-enter > * { animation: pageIn 0.38s cubic-bezier(0.2, 0.7, 0.3, 1) both; }
+      @keyframes pageIn {
+        from { opacity: 0; transform: translateY(12px); }
+        to { opacity: 1; transform: none; }
+      }
+      /* Tactile press feedback on interactive controls. */
+      .btn, .btn-primary, .btn-secondary, .btn-small,
+      .nav-tab, .icon-btn, .link-btn {
+        transition: transform 0.12s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+      }
+      .btn:active, .btn-primary:active, .btn-secondary:active, .btn-small:active,
+      .nav-tab:active, .icon-btn:active {
+        transform: scale(0.96);
+      }
+      /* Chat messages glide in as they arrive. */
+      .chat-msg-wrap { animation: msgIn 0.3s cubic-bezier(0.2, 0.7, 0.3, 1) both; }
+      @keyframes msgIn {
+        from { opacity: 0; transform: translateY(10px) scale(0.98); }
+        to { opacity: 1; transform: none; }
+      }
+      /* Header logo: gentle neon pulse on hover/tap. */
+      .phi-mark-btn img { transition: filter 0.25s ease, transform 0.25s ease; }
+      .phi-mark-btn:hover img, .phi-mark-btn:active img {
+        transform: scale(1.06);
+        filter: drop-shadow(0 0 10px rgba(0,230,118,0.85)) drop-shadow(0 0 26px rgba(0,230,118,0.4));
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .tab-enter > *, .chat-msg-wrap { animation: none; }
+        .btn:active, .btn-primary:active, .btn-secondary:active, .btn-small:active,
+        .nav-tab:active, .icon-btn:active { transform: none; }
+      }
 
       /* ---------------- Top nav ---------------- */
       .top-nav {
